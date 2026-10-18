@@ -1,0 +1,15 @@
+# data-agent dependencies (locked to major.minor)
+fastapi>=0.115
+uvicorn
+python-multipart[standard]>=0.30
+langgraph>=0.2
+duckdb>=1.1
+sqlglot>=25
+sqlalchemy>=2.0
+pandas>=2.2
+pymysql>=1.1
+openpyxl>=3.1
+pyarrow>=17.0
+pytest>=8.0
+httpx>=0.27
+openai>=1.40

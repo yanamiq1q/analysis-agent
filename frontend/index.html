@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>data-agent 数据分析助手</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --line:#262b36; --text:#e6e9ef; --muted:#8b93a3; --accent:#4da3ff; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: "Segoe UI", "Microsoft YaHei", sans-serif; height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 16px; font-weight: 600; }
+  header .status { margin-left: auto; font-size: 12px; color: var(--muted); }
+  #chat { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+  .msg { max-width: 72%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+  .user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+  .assistant { align-self: flex-start; background: var(--card); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+  .progress { color: var(--muted); font-size: 13px; align-self: flex-start; }
+  footer { padding: 16px 24px; border-top: 1px solid var(--line); display: flex; gap: 12px; }
+  textarea { flex: 1; background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 14px; resize: none; height: 52px; font-family: inherit; }
+  textarea:focus { outline: 1px solid var(--accent); }
+  button { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 0 20px; font-size: 14px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #fileBtn { background: transparent; border: 1px solid var(--line); color: var(--muted); }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>data-agent</h1>
+  <div class="status" id="status">空闲</div>
+</header>
+<div id="chat"></div>
+<footer>
+  <button id="fileBtn">上传数据</button>
+  <input type="file" id="fileInput" accept=".csv,.xlsx,.xls,.json,.parquet">
+  <textarea id="input" placeholder="输入你的问题，例如：各商品销售额排行"></textarea>
+  <button id="sendBtn">发送</button>
+</footer>
+
+<script>
+// SSE 消费端：fetch + getReader + TextDecoder(stream:true) 手写解析。
+// 不用浏览器原生 EventSource 的原因：EventSource 只支持 GET、
+// 不能带请求体，也无法自定义 headers —— 而聊天接口必须 POST。
+const chat = document.getElementById('chat');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('sendBtn');
+const statusEl = document.getElementById('status');
+const fileInput = document.getElementById('fileInput');
+document.getElementById('fileBtn').onclick = () => fileInput.click();
+
+// session_id 存 localStorage：刷新页面后仍是同一会话（后端内存里没有
+// 的话会重开，这里补一个"透明重开"：后端永远以请求自带 history 为准）
+const sessionId = localStorage.getItem('da_session') || crypto.randomUUID();
+localStorage.setItem('da_session', sessionId);
+
+function addMessage(role, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+function addProgress(text) {
+  const div = document.createElement('div');
+  div.className = 'progress';
+  div.textContent = '⏳ ' + text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+// 断线重连：网络中断（fetch 失败/读流失败）自动重发同一请求，
+// 退避 1s/2s/3s，最多 3 次；重发带 retry 标记让后端幂等去重。
+// 服务端错误（HTTP 4xx/5xx）不重试——那是业务错误，重发无意义。
+const MAX_RETRY = 3;
+let retryCount = 0;
+
+class ServerError extends Error {}
+
+async function send() {
+  const message = input.value.trim();
+  if (!message) return;
+  addMessage('user', message);  // 用户消息只渲染一次，重连不重复
+  input.value = '';
+  sendBtn.disabled = true;
+  statusEl.textContent = '处理中';
+  retryCount = 0;
+  await sendOnce(message);
+  sendBtn.disabled = false;
+}
+
+async function sendOnce(message) {
+  // 本轮起点：重连前把中断留下的半截输出（进度行+答案气泡）回滚掉，
+  // 后端会从 start 帧开始重发完整事件流
+  const baseCount = chat.children.length;
+  let answerBox = null;
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, message, retry: retryCount > 0 }),
+    });
+    if (!res.ok) throw new ServerError('服务端错误 HTTP ' + res.status);
+    // 手写 SSE 解析：read() 返回的 chunk 可能把一行切成两半，
+    // 必须用 stream:true 保留不完整字节 + 手动按 \n\n 切帧
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        if (frame.startsWith('data: ')) {
+          const evt = JSON.parse(frame.slice(6));
+          if (evt.type === 'node') {
+            addProgress(evt.message);
+          } else if (evt.type === 'answer') {
+            answerBox = addMessage('assistant', evt.text);
+          }
+        }
+      }
+    }
+    if (!answerBox) addMessage('assistant', '（无回答）');
+    statusEl.textContent = '空闲';
+  } catch (err) {
+    if (!(err instanceof ServerError) && retryCount < MAX_RETRY) {
+      retryCount += 1;
+      statusEl.textContent = `连接中断，正在重连（${retryCount}/${MAX_RETRY}）…`;
+      await new Promise(r => setTimeout(r, retryCount * 1000));
+      // 回滚本轮半截输出后重试（后端按 retry 标记对历史做幂等去重）
+      while (chat.children.length > baseCount) chat.removeChild(chat.lastChild);
+      return sendOnce(message);
+    }
+    addMessage('assistant', err instanceof ServerError
+      ? err.message
+      : '请求失败（已重连 ' + MAX_RETRY + ' 次仍失败）: ' + err.message);
+    statusEl.textContent = '空闲';
+  }
+}
+
+sendBtn.onclick = send;
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+
+fileInput.onchange = async () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch('/api/upload', { method: 'POST', body: form });
+    const data = await res.json();
+    addMessage('assistant', res.ok
+      ? '已加载表: ' + data.tables.join(', ')
+      : '上传失败: ' + (data.detail || res.status));
+  } catch (err) {
+    addMessage('assistant', '上传失败: ' + err.message);
+  } finally {
+    fileInput.value = '';
+  }
+};
+</script>
+</body>
+</html>
