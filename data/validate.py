@@ -174,19 +174,35 @@ def collect_referenced_tables(stmt) -> set[str]:
     return referenced
 
 
-# ---------- 表名白名单（内部实现） ----------
+# ---------- 文件读取路径白名单（内部实现） ----------
 
 def _validate_table_whitelist(stmt, allowed_tables: list[str]) -> Optional[str]:
     """表级白名单：SQL 引用的物理表必须全部在 allowed_tables 内。
 
+    关键点：CTE 别名不算物理表。WITH x AS (...) SELECT * FROM x 里
+    的 x 是查询内部定义的临时名，必须从引用集合里剔除，否则会误杀
+    合法 CTE 查询。
     大小写不敏感：表名统一 casefold 比较（DuckDB 表名本身不敏感）。
     """
     allowed = {str(t).casefold() for t in allowed_tables}
 
-    offenders = {
-        t for t in collect_referenced_tables(stmt)
-        if str(t).casefold() not in allowed
-    }
+    # CTE 别名集合：WITH 子句里定义的临时名
+    cte_aliases: set[str] = set()
+    for cte in stmt.find_all(exp.CTE):
+        alias = cte.alias or cte.args.get("alias")
+        if alias:
+            cte_aliases.add(str(alias).casefold())
+
+    offenders: set[str] = set()
+    for table in stmt.find_all(exp.Table):
+        name = table.name
+        if not name:
+            continue
+        folded = str(name).casefold()
+        if folded in cte_aliases:
+            continue
+        if folded not in allowed:
+            offenders.add(str(name))
 
     if offenders:
         available = ", ".join(sorted(allowed_tables)) or "（无）"

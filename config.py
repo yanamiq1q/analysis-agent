@@ -41,6 +41,16 @@ LLM_TIMEOUT_SECONDS = float(os.getenv("DATA_AGENT_LLM_TIMEOUT", "30"))
 MAX_SQL_RETRIES = 3
 # 最终答案展示给用户的最大行数
 MAX_RESULT_ROWS = 20
+# 拼进 prompt 的最近会话消息数（3 轮问答），防无限膨胀
+MAX_HISTORY_MESSAGES = 6
+
+# ---- ReAct 多工具循环（M6）----
+# 单次问答最多允许的 Agent 步数（一次步数 = 一轮 LLM 决策）：
+# 防 LLM 反复调用工具/索要结果死循环，超限强制终止并返回提示
+MAX_REACT_STEPS = int(os.getenv("DATA_AGENT_REACT_STEPS", "8"))
+# 绘图工具最多支持的数据点数：LLM 若查出超大分组结果，图截断到
+# 该行数再画（文字结果不受影响），避免一张图堆几百根柱子没法看
+MAX_PLOT_ROWS = int(os.getenv("DATA_AGENT_MAX_PLOT_ROWS", "200"))
 
 # ---- 查询护栏（生产级硬伤修复）----
 # 单次查询最大执行秒数：防止 LLM 生成的霸王 SQL（笛卡尔积/全表扫）

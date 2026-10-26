@@ -1,17 +1,22 @@
-"""指标字典（M4）：把数仓指标口径结构化，供 Agent 生成 SQL 时复用。
+"""指标字典（M4/M8）：把数仓指标口径结构化，供 Agent 生成 SQL 时复用。
+
+M8 起口径数据源从本文件的内置常量搬进了 skills/ 包（配置即数据）：
+  - 数据定义：skills/metrics/references/metrics.md（改口径零代码）
+  - 解析渲染：agent/skill_loader.py 把 references 解析成 Metric 列表
+本文件只保留：Metric 数据结构 + 匹配逻辑 + 锁表 prompt 格式化。
+三者都是纯函数，registry 由上层显式传入——口径只能被喂进来，
+不能由 LLM 自由发挥。
 
 对应数仓经验：
   - 指标口径这个词就是 ADS 层的"口径说明书"——同一个业务名词
     （如"销售额"），不同团队算法可能不同（下单即计入 vs 支付才计入）。
-  - 把口径写死在 SQL 里灌给 LLM，能根治 LLM 自由发挥导致的口径漂移。
+  - 把口径写死灌给 LLM，能根治 LLM 自由发挥导致的口径漂移。
 
 设计：
   - Metric 的 tables 是该指标依赖的表（必须全部已加载进 DuckDB 才注入），
     与具体 MySQL 实例解耦：stdw 表导出 CSV 上传后同名即命中。
   - match_metrics 只做关键词包含匹配（个人项目不引入向量检索），
     命中条件是"问题文本含任一别名 且 依赖表齐全"。
-  - STDW_METRICS 是内置的电商订单场景示例指标集（对齐 stdw 库口径），
-    表名对不上时直接改这里即可，不影响任何代码。
 """
 from __future__ import annotations
 
@@ -27,56 +32,6 @@ class Metric:
     description: str          # 口径说明：给 LLM 看的"为什么这么算"
 
 
-# 电商订单场景示例（对齐 stdw 库分层：ODS 层表）
-STDW_METRICS: list[Metric] = [
-    Metric(
-        name="gmv",
-        aliases=("销售额", "成交额", "交易额", "gmv"),
-        sql="SELECT SUM(amount) AS gmv FROM ods_order_info",
-        tables=("ods_order_info",),
-        description="GMV 统计口径：按下单金额计入（含未支付订单）。",
-    ),
-    Metric(
-        name="order_cnt",
-        aliases=("订单量", "订单数", "下单量", "成交单量"),
-        sql="SELECT COUNT(*) AS order_cnt FROM ods_order_info",
-        tables=("ods_order_info",),
-        description="订单量口径：按订单主表行数统计，一笔订单记 1 次。",
-    ),
-    Metric(
-        name="pay_order_cnt",
-        aliases=("支付订单数", "支付订单量", "成交订单数"),
-        sql=(
-            "SELECT COUNT(*) AS pay_order_cnt FROM ods_order_info "
-            "WHERE status = 'paid'"
-        ),
-        tables=("ods_order_info",),
-        description="支付订单口径：status='paid' 的订单，区别于下单量。",
-    ),
-    Metric(
-        name="pay_convert_rate",
-        aliases=("支付转化率", "成交转化率", "转化率"),
-        sql=(
-            "SELECT "
-            "SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) * 1.0 "
-            "/ COUNT(*) AS pay_convert_rate FROM ods_order_info"
-        ),
-        tables=("ods_order_info",),
-        description="支付转化率口径：支付订单数 / 总下单数（小数，非百分数）。",
-    ),
-    Metric(
-        name="avg_order_amount",
-        aliases=("客单价", "人均消费", "arpu"),
-        sql=(
-            "SELECT SUM(amount) * 1.0 / COUNT(DISTINCT user_id) "
-            "AS avg_order_amount FROM ods_order_info"
-        ),
-        tables=("ods_order_info",),
-        description="客单价口径：销售总额 / 去重用户数（按人平均，不按单平均）。",
-    ),
-]
-
-
 def match_metrics(
     question: str,
     available_tables: set[str],
@@ -88,9 +43,10 @@ def match_metrics(
       ① 依赖表齐全：metric.tables 是 available_tables 的子集
       ② 别名命中：问题文本包含任一别名（大小写不敏感）
 
-    registry 参数留给"用户自定义指标集"，默认用内置 STDW_METRICS。
+    registry 为空（M8：口径数据源由上层从 skill 包渲染后显式传入）：
+    不匹配任何指标——不喂口径，好过喂错口径。
     """
-    metrics = registry if registry is not None else STDW_METRICS
+    metrics = registry or []
     question_lower = question.lower()
     matched: list[Metric] = []
     for m in metrics:
@@ -102,11 +58,25 @@ def match_metrics(
 
 
 def format_metrics_prompt(matched: list[Metric]) -> str:
-    """把匹配到的指标拼成给 LLM 的口径说明文本（并入 schema 上下文）。"""
+    """把匹配到的指标拼成给内层 LLM 的口径说明（并入 schema 上下文）。
+
+    措辞刻意是"锁表"而不是"建议"：实测发现只写"必须优先套用口径 SQL"
+    约束力不足——当上游把某张表名写进子问题（如"订单事实表
+    dwd_order_fact 的总 GMV"）时，LLM 会优先听表名、绕开口径字典。
+    所以这里把责任表显式点出、明令禁止换表，并堵掉"表为空就换张表算"
+    这个兜底路径——那正是口径漂移最隐蔽的入口。
+    """
     if not matched:
         return ""
-    lines = ["### 指标口径字典（必须优先按以下口径生成 SQL）"]
+    lines = [
+        "### 指标口径字典（命中以下指标时，必须严格按口径生成 SQL）",
+        "硬性约束：",
+        "1. 只能查询「责任表」列出的表，禁止改用其它表（含汇总表、事实表）；",
+        "2. 若责任表查不到数据，直接回复该口径表无数据，不得用其它表替代计算；",
+        "3. 聚合逻辑必须与口径 SQL 完全一致，不得自行改写。",
+    ]
     for m in matched:
         lines.append(f"【{m.name}】{m.description}")
+        lines.append(f"责任表: {', '.join(m.tables)}（仅限）")
         lines.append(f"口径 SQL: {m.sql}")
     return "\n".join(lines)

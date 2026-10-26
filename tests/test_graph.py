@@ -5,6 +5,7 @@ import pytest
 from agent.graph import build_graph, run_analysis
 from agent.llm import _extract_sql
 from data.engine import AnalysisEngine
+from data.metrics import Metric
 from data.service import DataService
 
 
@@ -223,21 +224,45 @@ class TestMetricsInjection:
         )
         return svc
 
-    def test_matched_metric_injected_into_schema(self, ods_service):
+    @pytest.fixture
+    def gmv_registry(self):
+        # M8：口径数据源由上层显式传入（生产从 skills 包渲染，
+        # 见 agent/skill_loader.py），测试自建单指标注册表
+        return [
+            Metric(
+                name="gmv",
+                aliases=("销售额", "成交额", "交易额", "gmv"),
+                sql="SELECT SUM(amount) AS gmv FROM ods_order_info",
+                tables=("ods_order_info",),
+                description="GMV 统计口径：按下单金额计入（含未支付订单）。",
+            )
+        ]
+
+    def test_matched_metric_injected_into_schema(self, ods_service, gmv_registry):
         # 问"销售额"且 ods_order_info 已加载 → LLM 收到的 schema 含 gmv 口径
         llm = FakeLLM("SELECT SUM(amount) AS gmv FROM ods_order_info")
-        graph = build_graph(ods_service, llm)
+        graph = build_graph(ods_service, llm, metric_registry=gmv_registry)
         graph.invoke({"question": "今天的销售额是多少"})
 
         _, schema_text, _ = llm.calls[0]
         assert "指标口径字典" in schema_text
         assert "SUM(amount)" in schema_text  # 标准口径 SQL 已注入
 
-    def test_irrelevant_question_no_metric(self, ods_service):
+    def test_irrelevant_question_no_metric(self, ods_service, gmv_registry):
         # 问题与指标无关 → schema 不含口径字典
         llm = FakeLLM("SELECT * FROM ods_order_info")
-        graph = build_graph(ods_service, llm)
+        graph = build_graph(ods_service, llm, metric_registry=gmv_registry)
         graph.invoke({"question": "表里有几行数据"})
+
+        _, schema_text, _ = llm.calls[0]
+        assert "指标口径字典" not in schema_text
+
+    def test_no_registry_no_metric_injected(self, ods_service):
+        # M8 语义：registry 未配置（skills 包缺失/未渲染）→ 不匹配任何
+        # 指标——不喂口径好过喂错口径（fail-closed）
+        llm = FakeLLM("SELECT * FROM ods_order_info")
+        graph = build_graph(ods_service, llm)
+        graph.invoke({"question": "今天的销售额是多少"})
 
         _, schema_text, _ = llm.calls[0]
         assert "指标口径字典" not in schema_text

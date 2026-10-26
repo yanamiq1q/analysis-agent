@@ -25,7 +25,7 @@ from langgraph.graph import END, START, StateGraph
 import config
 from agent.llm import SqlGenerator
 from agent.state import AgentState
-from data.metrics import format_metrics_prompt, match_metrics
+from data.metrics import Metric, format_metrics_prompt, match_metrics
 from data.service import DataService
 from data.validate import validate_sql
 from logging_setup import get_logger
@@ -33,7 +33,7 @@ from logging_setup import get_logger
 logger = get_logger("agent.graph")
 
 
-_MAX_HISTORY_MESSAGES = 6  # 拼进 prompt 的最近消息数（3 轮问答），防无限膨胀
+_MAX_HISTORY_MESSAGES = config.MAX_HISTORY_MESSAGES  # 拼进 prompt 的最近消息数，防无限膨胀
 
 
 def _build_history_text(history: list[dict]) -> str:
@@ -52,8 +52,17 @@ def _build_history_text(history: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_graph(service: DataService, llm: SqlGenerator) -> StateGraph:
-    """构建并编译 LangGraph。llm 必须是 (question, schema, error) -> sql 的函数。"""
+def build_graph(
+    service: DataService,
+    llm: SqlGenerator,
+    metric_registry: list[Metric] | None = None,
+) -> StateGraph:
+    """构建并编译 LangGraph。llm 必须是 (question, schema, error) -> sql 的函数。
+
+    metric_registry（M8）：指标口径数据源改为显式传入，由上层
+    （server / 工具注册表）从 skill 包渲染；None 时 match_metrics
+    回落到内置默认集（M4 行为，供旧调用方与迁移期兼容）。
+    """
 
     # ── 节点1：收集表结构 + 匹配指标口径 ──────────────────────────
     def collect_schema(state: dict) -> dict:
@@ -82,7 +91,7 @@ def build_graph(service: DataService, llm: SqlGenerator) -> StateGraph:
 
         # 指标口径注入：M4
         question = state.get("question", "")
-        matched = match_metrics(question, set(tables))
+        matched = match_metrics(question, set(tables), metric_registry)
         if matched:
             logger.info("collect_schema matched_metrics=%s",
                         [m.name for m in matched])
@@ -184,7 +193,9 @@ def build_graph(service: DataService, llm: SqlGenerator) -> StateGraph:
             f"共 {len(df)} 行，展示前 {len(head)} 行：\n"
             + head.to_string(index=False)
         )
-        return {"result_text": result_text, "error": ""}
+        # df 一并放进 state：图走链路（plot_chart 工具）需要结构化
+        # 数据而非文本二次解析（M7 图表可视化）
+        return {"result_text": result_text, "error": "", "df": df}
 
     # ── 条件边：执行结果路由 ──────────────────────────────────────
     def route_after_execute(state: dict) -> str:
@@ -228,6 +239,7 @@ def run_analysis(
     llm: SqlGenerator,
     question: str,
     history: list[dict] | None = None,
+    metric_registry: list[Metric] | None = None,
 ) -> dict:
     """便捷入口：问题 → 答案。返回 dict 而非裸文本（M5b）。
 
@@ -236,7 +248,7 @@ def run_analysis(
     多轮记忆。图本身保持无状态（对齐旧项目"无状态 Agent + 有状态
     后端"的分工），历史由调用侧（未来的 FastAPI session 层）持有。
     """
-    graph = build_graph(service, llm)
+    graph = build_graph(service, llm, metric_registry=metric_registry)
     result = graph.invoke({"question": question, "history": history or []})
     text = result.get("result_text") or result.get("error") or "（无输出）"
     # 只保留 role/content 两个字段，删掉 state 里的内部字段，避免污染历史
@@ -244,4 +256,5 @@ def run_analysis(
         {"role": "user", "content": question},
         {"role": "assistant", "content": text},
     ]
-    return {"result_text": text, "history": new_history}
+    # df 供上层（plot_chart 工具）直接取结构化结果，M7 图表用
+    return {"result_text": text, "history": new_history, "df": result.get("df")}

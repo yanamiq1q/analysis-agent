@@ -1,0 +1,16 @@
+1 skill prompt mcp 区别和联系
+out join 和 union 性能哪个好
+那种join性能最好
+
+2 大表left  join 关联小表有什么问题 优化操作有哪些 answer:doris 自动优化了， 
+3 ai幻觉有没有，怎么减少幻觉
+4 agent的调用是什么样的，层次是怎么样
+5 llm是在那一层运用的，答：只在最后生成回答的时候
+应用 (?)
+6 实习主要做了什么内容 
+7 你做的agent主要实现了什么功能？
+数据库连接是怎么写的，只是api吗？
+反问：mcp skill prompt 
+a:skill提供流程
+prompt 主要是约束，二者不为一
+mcp是多agent之间的调用流程（比较重要）

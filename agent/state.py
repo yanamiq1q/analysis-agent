@@ -17,3 +17,5 @@ class AgentState(TypedDict, total=False):
     error: str        # 节点3/4 产出：校验/执行错误（重试时喂回 LLM）
     result_text: str  # 节点4 产出：最终给用户的答案文本
     attempts: int     # 已经尝试生成 SQL 的次数（重试上限用）
+    df: object        # 节点4 产出：查询结果的 DataFrame（M7 图表用，
+                      # plot_chart 工具从这里取结构化数据而非解析文本）

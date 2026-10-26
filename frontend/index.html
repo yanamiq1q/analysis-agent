@@ -16,6 +16,13 @@
   .user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
   .assistant { align-self: flex-start; background: var(--card); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
   .progress { color: var(--muted); font-size: 13px; align-self: flex-start; }
+  .chart-img { max-width: 100%; border-radius: 8px; display: block; background: #fff; padding: 8px; }
+  /* Agent 步骤卡片：展示工具调用（名字/参数/结果），让用户看到"它在做什么" */
+  .tool { align-self: flex-start; max-width: 72%; background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 14px; font-size: 13px; }
+  .tool.tool-err { border-left-color: #e8463a; }
+  .tool .tname { color: var(--accent); font-weight: 600; font-family: Consolas, monospace; }
+  .tool .targs { color: var(--muted); font-family: Consolas, monospace; margin-top: 4px; word-break: break-all; }
+  .tool .tres { color: var(--text); margin-top: 6px; white-space: pre-wrap; opacity: .8; }
   footer { padding: 16px 24px; border-top: 1px solid var(--line); display: flex; gap: 12px; }
   textarea { flex: 1; background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 14px; resize: none; height: 52px; font-family: inherit; }
   textarea:focus { outline: 1px solid var(--accent); }
@@ -33,6 +40,7 @@
 <div id="chat"></div>
 <footer>
   <button id="fileBtn">上传数据</button>
+  <button id="dbBtn">连接数据库</button>
   <input type="file" id="fileInput" accept=".csv,.xlsx,.xls,.json,.parquet">
   <textarea id="input" placeholder="输入你的问题，例如：各商品销售额排行"></textarea>
   <button id="sendBtn">发送</button>
@@ -63,13 +71,52 @@ function addMessage(role, text) {
   return div;
 }
 
+// 打字机：把 text 逐字写入 el，像 AI 那样"流"出来而不是整段闪现。
+// 按时长打字而不是按固定帧数：短句约 0.5s、长文本最多 1.6s。
+// （最早按帧数写，短句 0.2s 就闪完了，肉眼几乎看不出流式效果）
+function typeInto(el, text, done) {
+  el.textContent = '';
+  if (!text) { if (done) done(); return; }
+  const totalMs = Math.min(1600, Math.max(400, text.length * 35));
+  const start = performance.now();
+  const timer = setInterval(() => {
+    const p = Math.min(1, (performance.now() - start) / totalMs);
+    el.textContent = text.slice(0, Math.ceil(text.length * p));
+    chat.scrollTop = chat.scrollHeight;
+    if (p >= 1) { clearInterval(timer); if (done) done(); }
+  }, 16);
+}
+
 function addProgress(text) {
   const div = document.createElement('div');
   div.className = 'progress';
-  div.textContent = '⏳ ' + text;
   chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
+  typeInto(div, '⏳ ' + text);   // 真实内容逐字写出
   return div;
+}
+
+// Agent 步骤卡片：工具名 + 调用参数 + 结果摘要。
+// 这是 ReAct 的"思考过程"——deepseek-chat 决定调工具时不产出推理
+// 文本，模型的动作（查了哪张表、拿到什么）才是可展示的思考。
+function addToolCard(ev) {
+  const div = document.createElement('div');
+  div.className = 'tool' + (ev.ok ? '' : ' tool-err');
+  const name = document.createElement('div');
+  name.className = 'tname';
+  const args = document.createElement('div');
+  args.className = 'targs';
+  const res = document.createElement('div');
+  res.className = 'tres';
+  div.appendChild(name);
+  div.appendChild(args);
+  div.appendChild(res);
+  chat.appendChild(div);
+  // 依次打字：工具名 → 参数 → 结果摘要，形成"一步步在做"的观感
+  typeInto(name, ev.name, () => {
+    typeInto(args, '参数: ' + (ev.arguments || '{}'), () => {
+      typeInto(res, '→ ' + (ev.result || ''));
+    });
+  });
 }
 
 // 断线重连：网络中断（fetch 失败/读流失败）自动重发同一请求，
@@ -120,7 +167,22 @@ async function sendOnce(message) {
         if (frame.startsWith('data: ')) {
           const evt = JSON.parse(frame.slice(6));
           if (evt.type === 'node') {
-            addProgress(evt.message);
+            // 空 message = 该步没有单独可展示的真实内容
+            // （如 tool_execute，其真实内容由紧随的 tool_call 卡片承载）
+            if (evt.message) addProgress(evt.message);
+          } else if (evt.type === 'tool_call') {
+            addToolCard(evt);
+          } else if (evt.type === 'chart') {
+            // 图表事件：base64 data URI 直接渲染成图片（独立气泡，
+            // 与文字答案分开展示更清晰）
+            const div = document.createElement('div');
+            div.className = 'msg assistant';
+            const img = document.createElement('img');
+            img.src = evt.image;
+            img.className = 'chart-img';
+            div.appendChild(img);
+            chat.appendChild(div);
+            chat.scrollTop = chat.scrollHeight;
           } else if (evt.type === 'answer') {
             answerBox = addMessage('assistant', evt.text);
           }
@@ -165,6 +227,38 @@ fileInput.onchange = async () => {
     addMessage('assistant', '上传失败: ' + err.message);
   } finally {
     fileInput.value = '';
+  }
+};
+
+// 连接远端 MySQL：连接串含密码，用 prompt 当场输入、不做任何存储。
+// 后端按冷热分层接入：小表搬进 DuckDB，大表留远端下推。
+document.getElementById('dbBtn').onclick = async () => {
+  const url = prompt(
+    'MySQL 连接串（请把 PASSWORD 替换成真实密码）:',
+    'mysql+pymysql://root:PASSWORD@127.0.0.1:3306/stdw'
+  );
+  if (!url) return;
+  statusEl.textContent = '连接中';
+  addMessage('assistant', '正在连接远端库…');
+  try {
+    const res = await fetch('/api/connect_mysql', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      addMessage('assistant', '连接失败: ' + (data.detail || res.status));
+    } else {
+      addMessage('assistant',
+        '连接成功。本地已搬运 ' + data.moved.length + ' 张表，'
+        + '远端保留 ' + data.large.length + ' 张大表。\n当前可用表: '
+        + data.tables.join(', '));
+    }
+  } catch (err) {
+    addMessage('assistant', '连接失败: ' + err.message);
+  } finally {
+    statusEl.textContent = '空闲';
   }
 };
 </script>
