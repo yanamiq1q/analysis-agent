@@ -1,0 +1,56 @@
+# 口径锁定模板：模板不写 SQL，直接引用 skills/metrics 里的指标口径。
+#
+# 和 monthly_ecom 的区别：
+#   - monthly_ecom 的 SQL 是模板作者手写的（灵活，但口径可能漂移）
+#   - 本模板只写 `metric: <name>`，SQL 来自指标注册表（改口径只改 references/metrics.md）
+#
+# 适合"口径必须锁死"的经营指标页；日期列用 date_column 声明，
+# 不声明就是全量口径（源表没有日期列时必须写清 caveat）。
+
+name: monthly_ecom_locked
+title: "{year} 年 {month} 月经营指标（口径锁定）"
+description: 直接引用指标口径，不手写 SQL
+
+sections:
+  - id: gmv
+    heading: GMV（口径锁定）
+    metric: gmv
+    caveats:
+      - "ods_order_info 没有日期列，本节为全量口径，不随月份变化"
+    metrics:
+      - name: gmv
+        label: GMV
+        unit: 元
+        format: money
+
+  - id: order_cnt
+    heading: 订单量（口径锁定）
+    metric: order_cnt
+    metrics:
+      - name: order_cnt
+        label: 订单量
+        unit: 单
+        format: int
+    caveats:
+      - "ods_order_info 没有日期列，本节为全量口径"
+
+  - id: pay_convert_rate
+    heading: 支付转化率（口径锁定）
+    metric: pay_convert_rate
+    metrics:
+      - name: pay_convert_rate
+        label: 支付转化率
+        format: percent
+    caveats:
+      - "口径：支付订单数 / 总订单数（小数，非百分数）"
+
+  - id: avg_order_amount
+    heading: 客单价（口径锁定）
+    metric: avg_order_amount
+    metrics:
+      - name: avg_order_amount
+        label: 客单价
+        unit: 元
+        format: money
+    caveats:
+      - "口径：销售总额 / 去重用户数（按人平均，不按单平均）"

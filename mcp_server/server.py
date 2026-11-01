@@ -418,7 +418,7 @@ def build_mcp_server(
                 force=force,
             )
             manager = get_job_manager()
-            job_id = manager.submit(_service(), request)
+            job_id = manager.submit(_service(), request, _catalog().registry)
             payload = manager.wait(job_id, wait_seconds)
         except ReportError as exc:
             raise ValueError(str(exc)) from exc

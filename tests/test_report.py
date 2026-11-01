@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from data.engine import AnalysisEngine
+from data.metrics import Metric
 from data.report.charts import chart_data, render_png
 from data.report.pipeline import (
     ReportError,
@@ -370,3 +371,107 @@ class TestCompare:
             meta={"generated_at": "now"},
         )
         assert any("reason" in p for p in spec.validate())
+
+class TestMetricReference:
+    """模板不写 SQL，引用指标注册表里的口径。"""
+
+    @staticmethod
+    def _registry():
+        return [
+            Metric("gmv", ("gmv",), "SELECT SUM(amount) AS gmv FROM ods_order_info",
+                   ("ods_order_info",), "订单金额求和"),
+            Metric("order_cnt", ("订单量",), "SELECT COUNT(*) AS order_cnt FROM ods_order_info",
+                   ("ods_order_info",), "订单行数"),
+        ]
+
+    def test_locked_template_uses_registry_sql(self, service, tmp_path):
+        spec = run_report(
+            service, ReportRequest("monthly_ecom_locked", "2026-10-01", "2026-11-01"),
+            out_root=tmp_path, metric_registry=self._registry(),
+        )
+        gmv = spec.sections[0]
+        assert not gmv.skipped
+        assert gmv.metrics[0].value == 100.0          # 10+20+30+40
+        assert any("口径" in c for c in gmv.caveats)   # 口径说明自动进 caveats
+        # 注册表里没有的指标 → 跳过并说明
+        assert spec.sections[2].skipped.startswith("指标未找到")
+
+    def test_metric_with_date_column_filters(self, service, tmp_path):
+        templates = {"m": {"name": "m", "title": "{year}-{month}", "sections": [{
+            "id": "x", "heading": "x", "metric": "gmv_ads", "date_column": "dt",
+            "metrics": [{"name": "gmv", "label": "GMV"}],
+        }]}}
+        metric = Metric("gmv_ads", ("GMV",),
+                        "SELECT SUM(gmv) AS gmv FROM ads_order_daily_report",
+                        ("ads_order_daily_report",), "日汇总求和")
+        start, end = parse_period("2026-10-01:2026-10-14")
+        spec = run_report(
+            service, ReportRequest("m", start, end), out_root=tmp_path,
+            templates=templates, metric_registry=[metric],
+        )
+        expected = sum(82000.0 + i * 1000 for i in range(14))
+        assert spec.sections[0].metrics[0].value == pytest.approx(expected)
+
+    def test_metric_sql_puts_where_before_group_by(self):
+        from data.report.pipeline import _metric_sql
+
+        metric = Metric("x", (), "SELECT status, COUNT(*) AS n FROM ods_order_info GROUP BY status",
+                        ("ods_order_info",), "")
+        sql = _metric_sql(metric, "dt", "2026-10-01", "2026-11-01")
+        assert "WHERE" in sql.upper()
+        assert sql.upper().index("WHERE") < sql.upper().index("GROUP BY")
+
+
+class TestDemoData:
+    """演示数据：幂等、可回滚，补完能跑出正环比。"""
+
+    @staticmethod
+    def _make_db(path):
+        import duckdb
+
+        con = duckdb.connect(str(path))
+        con.execute("CREATE TABLE ads_order_daily_report "
+                    "(dt DATE, order_cnt BIGINT, gmv DOUBLE, pay_rate DOUBLE)")
+        rows = [(date(2026, 10, d), 60 + d, 80000.0 + d * 1000, 0.7) for d in range(1, 17)]
+        con.executemany("INSERT INTO ads_order_daily_report VALUES (?, ?, ?, ?)", rows)
+        con.close()
+
+    def test_seed_is_idempotent_and_reversible(self, tmp_path):
+        import duckdb
+
+        from data.report.demo_data import seed
+
+        db = tmp_path / "demo.duckdb"
+        self._make_db(db)
+
+        assert seed(db)["inserted"] == 45
+        seed(db)                                   # 再跑一次：先删后插，不重复
+        con = duckdb.connect(str(db))
+        assert con.execute(
+            "SELECT count(*) FROM ads_order_daily_report WHERE dt < DATE '2026-10-01'"
+        ).fetchone()[0] == 30
+        assert con.execute("SELECT count(*) FROM ads_order_daily_report").fetchone()[0] == 61
+        con.close()
+
+        seed(db, clean=True)                       # 回滚：只剩原始 16 行
+        con = duckdb.connect(str(db))
+        assert con.execute("SELECT count(*) FROM ads_order_daily_report").fetchone()[0] == 16
+        con.close()
+
+    def test_seeded_data_makes_mom_positive(self, tmp_path):
+        from data.report.demo_data import seed
+
+        db = tmp_path / "demo.duckdb"
+        self._make_db(db)
+        seed(db)
+        service = DataService(AnalysisEngine(db_path=str(db)))
+        try:
+            start, end = parse_period("2026-10")
+            spec = run_report(service, ReportRequest("monthly_ecom", start, end),
+                              out_root=tmp_path / "out")
+        finally:
+            service.engine.close()
+        kpi = spec.sections[0]
+        assert kpi.coverage["complete"] is True     # 整月补齐了
+        pct = kpi.metrics[0].compare["mom"]["pct"]
+        assert pct is not None and pct > 0.2        # 9 月基数低，环比为正

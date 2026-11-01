@@ -71,7 +71,7 @@ class JobManager:
 
     # ── 提交 ────────────────────────────────────────────────────
 
-    def submit(self, service, request: ReportRequest) -> str:
+    def submit(self, service, request: ReportRequest, metric_registry=None) -> str:
         """提交一次报告任务，立刻返回 job_id（不阻塞）。
 
         提交瞬间就写一条 ``queued`` 状态：否则宿主在 ``wait_seconds=0`` 时
@@ -97,16 +97,18 @@ class JobManager:
                     progress=0.0,
                     started_at=_now_iso(),
                 )
-            self._pool.submit(self._run, service, request, job_id)
+            self._pool.submit(self._run, service, request, job_id, metric_registry)
             return job_id
 
-    def _run(self, service, request: ReportRequest, job_id: str) -> None:
+    def _run(self, service, request: ReportRequest, job_id: str,
+             metric_registry=None) -> None:
         try:
             run_report(
                 service,
                 request,
                 out_root=self.root,
                 job_id=job_id,
+                metric_registry=metric_registry,
             )
         except Exception as exc:  # run_report 正常会先写 failed 再抛；这里兜底
             logger.warning("report job failed id=%s error=%s", job_id, exc)

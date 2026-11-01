@@ -282,7 +282,37 @@ def compare_metric(current, previous) -> dict:
     return {"prev": prev, "delta": delta, "pct": _num((cur - prev) / abs(prev))}
 
 
-def _graph(service):
+def _find_metric(registry, name: str):
+    for metric in registry or []:
+        if metric.name == name:
+            return metric
+    return None
+
+
+def _metric_sql(metric, date_column: str | None, start: str, end: str) -> str:
+    """把口径 SQL 变成"这一期"的 SQL。
+
+    没有 date_column 就直接用口径原文（比如 ods_order_info 没有日期列，
+    只能全量）；有的话用 sqlglot 往 AST 里追加 WHERE——不拼字符串，
+    这样 GROUP BY / 子查询都不会被拼坏。
+    """
+    sql = (metric.sql or "").strip().rstrip(";")
+    if not sql:
+        raise ReportError(f"指标 {metric.name} 的口径 SQL 为空")
+    if not date_column:
+        return sql
+    if not _IDENT_RE.match(str(date_column)):
+        raise ReportError(f"date_column 不合法: {date_column}")
+    stmt = sqlglot.parse_one(sql, dialect="duckdb")
+    if not isinstance(stmt, sqlglot.exp.Select):
+        raise ReportError(f"指标 {metric.name} 的口径 SQL 不是 SELECT，无法追加日期过滤")
+    condition = sqlglot.exp.condition(
+        f'"{date_column}" >= DATE \'{start}\' AND "{date_column}" < DATE \'{end}\''
+    )
+    return stmt.where(condition, append=True).sql(dialect="duckdb")
+
+
+def _graph(service, metric_registry=None):
     """构建报告图。service 注入（生产 DataService，测试内存引擎）。"""
     def prepare(state: ReportState) -> ReportState:
         request = state["request"]
@@ -309,7 +339,32 @@ def _graph(service):
                 "sql_tpl": raw.get("sql") or "",
                 "sql": "",
             }
-            if raw.get("sql"):
+            metric_name = str(raw.get("metric") or "").strip()
+            if metric_name:
+                # 口径引用：模板不写 SQL，直接取 skills/metrics 里锁定的口径
+                metric = _find_metric(metric_registry, metric_name)
+                if metric is None:
+                    available_names = ", ".join(m.name for m in (metric_registry or [])) or "无"
+                    section["skipped"] = f"指标未找到: {metric_name}（可用: {available_names}）"
+                else:
+                    missing = sorted(t for t in metric.tables if t not in available)
+                    if missing:
+                        section["skipped"] = f"缺少表: {', '.join(missing)}"
+                    else:
+                        try:
+                            section["sql_tpl"] = metric.sql
+                            section["sql"] = _metric_sql(
+                                metric, raw.get("date_column"), start, end
+                            )
+                        except Exception as exc:
+                            section["skipped"] = f"指标 SQL 生成失败: {exc}"
+                        else:
+                            section["metric_name"] = metric.name
+                            # 口径说明自动进 caveats，放最前面（渲染方必须展示）
+                            note = f"口径：{metric.description}" if metric.description else ""
+                            if note and note not in section["caveats"]:
+                                section["caveats"].insert(0, note)
+            elif raw.get("sql"):
                 section["sql"] = raw["sql"].format(start=start, end=end).strip()
                 try:
                     stmt = sqlglot.parse_one(section["sql"], dialect="duckdb")
@@ -323,7 +378,7 @@ def _graph(service):
                     # 缺表不报错：报告照样出，只是把这一节标成"跳过"
                     section["skipped"] = f"缺少表: {', '.join(missing)}"
             else:
-                section["skipped"] = "模板未提供 sql"
+                section["skipped"] = "模板未提供 sql 或 metric"
             sections.append(section)
 
         write_status(Path(state["job_dir"]), stage="planning")
@@ -649,6 +704,7 @@ def run_report(
     *,
     templates: Optional[dict[str, dict]] = None,
     job_id: Optional[str] = None,
+    metric_registry=None,
 ) -> ReportSpec:
     """跑一份报告，返回 ReportSpec（同时已落盘 report.json / status.json）。
 
@@ -708,7 +764,7 @@ def run_report(
         "sections": [],
     }
     try:
-        _graph(service).invoke(state)
+        _graph(service, metric_registry).invoke(state)
     except Exception as exc:
         logger.exception("report failed job=%s", job_id)
         write_status(

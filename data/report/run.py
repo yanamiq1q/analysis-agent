@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import config
+from agent.skill_loader import build_metric_registry, parse_skill_dir
 from data.report.pipeline import (
     TEMPLATES_DIR,
     ReportError,
@@ -48,6 +49,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         start, end = parse_period(args.period)
         service = DataService()
+        # 口径注册表：模板里写 `metric: gmv` 时从这里取锁定的口径 SQL
+        skills, _diagnostics = parse_skill_dir(config.PROJECT_ROOT / "skills")
+        registry = build_metric_registry(skills)
         spec = run_report(
             service,
             ReportRequest(
@@ -58,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
                 force=args.force,
             ),
             out_root=Path(args.out) if args.out else None,
+            metric_registry=registry,
         )
     except ReportError as exc:
         print(f"[失败] {exc}", file=sys.stderr)
