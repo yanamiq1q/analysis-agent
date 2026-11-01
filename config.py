@@ -54,7 +54,8 @@ MAX_PLOT_ROWS = int(os.getenv("DATA_AGENT_MAX_PLOT_ROWS", "200"))
 
 # ---- 查询护栏（生产级硬伤修复）----
 # 单次查询最大执行秒数：防止 LLM 生成的霸王 SQL（笛卡尔积/全表扫）
-# 卡死 worker。DuckDB 侧用线程池超时；MySQL 侧用 MAX_EXECUTION_TIME。
+# 卡死 worker。DuckDB 侧超时后用 conn.interrupt() 真打断（P0-5）；
+# MySQL 侧用 MAX_EXECUTION_TIME 服务端硬终止。
 QUERY_TIMEOUT_SECONDS = float(os.getenv("DATA_AGENT_QUERY_TIMEOUT", "30"))
 # 单次查询最大返回行数：超过直接报错，防止把整张表拉进内存
 MAX_QUERY_ROWS = int(os.getenv("DATA_AGENT_MAX_QUERY_ROWS", "100000"))
@@ -64,3 +65,33 @@ MYSQL_MAX_EXECUTION_TIME_MS = int(os.getenv("DATA_AGENT_MYSQL_TIMEOUT_MS", "3000
 # 必须明显小于 MySQL wait_timeout（默认 28800s），让连接主动轮换
 # 而不是被服务端被动断开；配合 pool_pre_ping 探活实现无感重连
 MYSQL_POOL_RECYCLE_SECONDS = int(os.getenv("DATA_AGENT_MYSQL_POOL_RECYCLE", "3600"))
+
+# ---- 内置 MCP 端点（P0-1）----
+# /mcp 的 Host 白名单：防 DNS rebinding。:* 表示任意端口。
+# 默认只放行本机，需要从局域网访问时用环境变量追加。
+MCP_ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.getenv(
+        "DATA_AGENT_MCP_ALLOWED_HOSTS",
+        "127.0.0.1,127.0.0.1:*,localhost,localhost:*,[::1],[::1]:*",
+    ).split(",")
+    if h.strip()
+]
+
+# ---- HITL：高危 SQL 人工确认（Sprint 1）----
+# 开关：关掉 = 回到"生成即执行"（保留旧路径，便于 A/B 对比与回滚）
+HITL_ENABLED = os.getenv("DATA_AGENT_HITL", "1") == "1"
+# 预估扫描行数超过该值 → 需要人工确认
+HITL_MAX_SCAN_ROWS = int(os.getenv("DATA_AGENT_HITL_MAX_SCAN_ROWS", "1000000"))
+# 待审批记录存活时间：超时后前端重连只会提示重新提问，不再回放卡片
+HITL_PENDING_TTL_SECONDS = int(os.getenv("DATA_AGENT_HITL_PENDING_TTL", "1800"))
+# 同时挂起的待审批上限（防止内存无限增长）；超出时淘汰最旧的
+HITL_MAX_PENDING = int(os.getenv("DATA_AGENT_HITL_MAX_PENDING", "50"))
+
+# ---- 报告流水线（PR1：给 WorkBuddy 渲染的报告包）----
+# 每次报告一个 job 目录：report.json（事实源）+ assets/（图表）+ status.json
+REPORT_JOBS_DIR = Path(
+    os.getenv("DATA_AGENT_REPORT_DIR", str(DATA_DIR / "report_jobs"))
+)
+# 一份报告允许的最长耗时（秒）：防止某节 SQL 卡住整个 job
+REPORT_TIMEOUT_SECONDS = int(os.getenv("DATA_AGENT_REPORT_TIMEOUT", "600"))

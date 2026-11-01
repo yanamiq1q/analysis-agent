@@ -1,0 +1,89 @@
+# 月度电商经营分析模板（ReportSpec v1）
+#
+# 约定：
+#   - sql 里的 {start} / {end} 会被替换成 ISO 日期（end 为开区间）
+#   - coverage 声明"这一节的数据来自哪张表的哪个日期列"：流水线会去查
+#     这个列在区间内实际覆盖了多少天，写进 report.json 的 coverage / warnings。
+#     不声明就只能靠渲染方肉眼发现"标题是整月、数据只有半个月"。
+#   - 没有日期列的表必须在 caveats 里写清"全量口径"，否则报告会误导人
+#   - chart.x / chart.y 明确指定列，不让 pandas 猜
+
+name: monthly_ecom
+title: "{year} 年 {month} 月电商经营分析"
+description: 月度核心指标 + 每日趋势 + 订单状态结构 + 高价值用户
+
+sections:
+  - id: kpi
+    heading: 核心指标
+    sql: >
+      SELECT SUM(gmv) AS gmv, SUM(order_cnt) AS orders, AVG(pay_rate) AS pay_rate
+      FROM ads_order_daily_report
+      WHERE dt >= DATE '{start}' AND dt < DATE '{end}'
+    coverage:
+      table: ads_order_daily_report
+      date_column: dt
+    compare: [mom]          # 环比：上一条 SQL 用上个月区间再跑一次
+    metrics:
+      - name: gmv
+        label: GMV
+        unit: 元
+        format: money
+        definition: ads_order_daily_report.gmv 在区间内求和
+      - name: orders
+        label: 订单量
+        unit: 单
+        format: int
+        definition: ads_order_daily_report.order_cnt 在区间内求和
+      - name: pay_rate
+        label: 平均支付率
+        format: percent
+        definition: 区间内 pay_rate 的算术平均（近似值，非加权）
+    narrative: "本期 GMV {gmv:,.0f} 元，订单 {orders:,.0f} 单，平均支付率 {pay_rate:.1%}。"
+    caveats:
+      - "数据来自日汇总表 ads_order_daily_report"
+
+  - id: gmv_trend
+    heading: 每日 GMV 趋势
+    sql: >
+      SELECT dt, gmv
+      FROM ads_order_daily_report
+      WHERE dt >= DATE '{start}' AND dt < DATE '{end}'
+      ORDER BY dt
+    coverage:
+      table: ads_order_daily_report
+      date_column: dt
+    chart:
+      kind: line
+      title: 每日 GMV
+      x: dt
+      y: gmv
+
+  - id: order_status
+    heading: 订单状态结构
+    sql: >
+      SELECT status, COUNT(*) AS orders, SUM(amount) AS amount
+      FROM ods_order_info
+      GROUP BY status
+      ORDER BY orders DESC
+    chart:
+      kind: bar
+      title: 订单状态分布
+      x: status
+      y: orders
+    table: true
+    caveats:
+      - "ods_order_info 没有日期列，本节是全量口径，不随月份变化"
+
+  - id: top_users
+    heading: 高价值用户 Top 5
+    sql: >
+      SELECT user_id, SUM(gmv) AS gmv
+      FROM dws_user_order_1d
+      WHERE dt >= DATE '{start}' AND dt < DATE '{end}'
+      GROUP BY user_id
+      ORDER BY gmv DESC
+      LIMIT 5
+    coverage:
+      table: dws_user_order_1d
+      date_column: dt
+    table: true
