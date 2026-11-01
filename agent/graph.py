@@ -52,6 +52,17 @@ def _build_history_text(history: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def format_result_text(df, max_rows: int = config.MAX_RESULT_ROWS) -> str:
+    """把查询结果转成回喂 LLM / 展示用的人话文本。
+
+    HITL 之后"执行"有两个入口（图内 execute 节点、确认后的 tool_execute），
+    格式化必须只有一处，否则两边的文本会慢慢漂移（比如一边带"共 N 行"、
+    一边不带），LLM 的后续判断就会不一致。
+    """
+    head = df.head(max_rows)
+    return f"共 {len(df)} 行，展示前 {len(head)} 行：\n" + head.to_string(index=False)
+
+
 def build_graph(
     service: DataService,
     llm: SqlGenerator,
@@ -60,8 +71,8 @@ def build_graph(
     """构建并编译 LangGraph。llm 必须是 (question, schema, error) -> sql 的函数。
 
     metric_registry（M8）：指标口径数据源改为显式传入，由上层
-    （server / 工具注册表）从 skill 包渲染；None 时 match_metrics
-    回落到内置默认集（M4 行为，供旧调用方与迁移期兼容）。
+    （app_context.AppContext 持有一份 catalog）从 skill 包 + 用户级
+    user_metrics.md 渲染；不传 = 空注册表（不喂口径，好过喂错口径）。
     """
 
     # ── 节点1：收集表结构 + 匹配指标口径 ──────────────────────────
@@ -165,9 +176,15 @@ def build_graph(
 
     # ── 条件边：校验结果路由 ──────────────────────────────────────
     def route_after_validate(state: dict) -> str:
-        """校验失败且没超重试次数 → 回 generate_sql 重写；否则执行。"""
+        """校验失败且没超重试次数 → 回 generate_sql 重写；否则执行。
+
+        HITL（Sprint 1）：plan_only 模式下校验通过就结束——这条链路
+        只负责"生成 + 校验"，执行由上层图在人工确认之后做。
+        """
         if state.get("error") and state.get("attempts", 0) < config.MAX_SQL_RETRIES:
             return "generate_sql"
+        if state.get("plan_only"):
+            return END
         return "execute"
 
     # ── 节点4：执行查询 ───────────────────────────────────────────
@@ -188,14 +205,9 @@ def build_graph(
             return {"error": f"SQL 执行失败: {exc}"}
         logger.info("execute ok rows=%d ms=%.1f",
                     len(df), (time.monotonic() - t0) * 1000)
-        head = df.head(config.MAX_RESULT_ROWS)
-        result_text = (
-            f"共 {len(df)} 行，展示前 {len(head)} 行：\n"
-            + head.to_string(index=False)
-        )
         # df 一并放进 state：图走链路（plot_chart 工具）需要结构化
         # 数据而非文本二次解析（M7 图表可视化）
-        return {"result_text": result_text, "error": "", "df": df}
+        return {"result_text": format_result_text(df), "error": "", "df": df}
 
     # ── 条件边：执行结果路由 ──────────────────────────────────────
     def route_after_execute(state: dict) -> str:
@@ -224,7 +236,9 @@ def build_graph(
     builder.add_conditional_edges(
         "validate_sql",
         route_after_validate,
-        {"generate_sql": "generate_sql", "execute": "execute"},
+        # END 必须在映射里：plan_only（HITL 的 dry-run）会直接结束，
+        # 缺这个 key 时 LangGraph 抛 KeyError: '__end__'（已踩坑）
+        {"generate_sql": "generate_sql", "execute": "execute", END: END},
     )
     builder.add_conditional_edges(
         "execute",
@@ -258,3 +272,31 @@ def run_analysis(
     ]
     # df 供上层（plot_chart 工具）直接取结构化结果，M7 图表用
     return {"result_text": text, "history": new_history, "df": result.get("df")}
+
+
+def run_plan(
+    service: DataService,
+    llm: SqlGenerator,
+    question: str,
+    history: list[dict] | None = None,
+    metric_registry: list[Metric] | None = None,
+) -> dict:
+    """HITL 的 dry-run 入口：只走"收集 schema → 生成 → 校验"，不执行。
+
+    返回 {"sql", "error"}：
+      - sql 非空且 error 为空 = 计划就绪，交给上层图判断风险 / 等确认；
+      - error 非空 = 这条子问题连 SQL 都生成不出来，直接当工具结果回喂。
+
+    复用同一张四节点图（plan_only 开关），不另写一条生成链路——
+    否则"生成逻辑"就有了第二份实现，校验口径迟早分叉。
+    """
+    graph = build_graph(service, llm, metric_registry=metric_registry)
+    result = graph.invoke({
+        "question": question,
+        "history": history or [],
+        "plan_only": True,
+    })
+    return {
+        "sql": result.get("sql") or "",
+        "error": result.get("error") or "",
+    }

@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import api.server as server
+from api.sessions import SessionStore
 from data.engine import AnalysisEngine
 from data.service import DataService
 
@@ -56,18 +57,38 @@ def tool_resp(name: str, args: str = "{}", call_id: str = "call_1") -> dict:
 
 
 @pytest.fixture
-def client(monkeypatch):
-    """每个测试独立的内存 service + fake 双模型 + 新会话表。"""
+def ctx(tmp_path, monkeypatch):
+    """每个测试独立的运行时上下文：内存引擎 + 临时技能目录 + 空会话表。
+
+    P0-2/P0-6 之后依赖从 AppContext 取（不再 monkeypatch 模块级变量）：
+    这也顺带证明「没有真实 API key、没有真实 data/warehouse 也能跑测试」。
+    """
+    import app_context
+    from app_context import AppContext, MetricCatalog
+
     svc = DataService(AnalysisEngine(db_path=None))
     svc.engine.register_table(
         "fruit",
         pd.DataFrame({"name": ["apple", "banana"], "price": [5, 3]}),
     )
-    monkeypatch.setattr(server, "service", svc)
-    monkeypatch.setattr(server, "llm", FakeLLM("SELECT count(*) AS n FROM fruit"))
+    ctx = AppContext(
+        service=svc,
+        catalog=MetricCatalog(
+            skills_dir=tmp_path / "skills",
+            user_metrics_path=tmp_path / "user_metrics.md",
+        ),
+    )
+    monkeypatch.setattr(app_context, "_context", ctx)
+    return ctx
+
+
+@pytest.fixture
+def client(ctx, monkeypatch):
+    """TestClient + 默认 fake 双模型（测试内可再改 ctx.chat_llm / ctx.sql_llm）。"""
+    ctx.sql_llm = FakeLLM("SELECT count(*) AS n FROM fruit")
     # 默认外层模型直接给出最终答案（测试工具链路时再换多轮 fake）
-    monkeypatch.setattr(server, "chat_llm", FakeChat(final_resp("共 1 行")))
-    monkeypatch.setattr(server, "_sessions", {})
+    ctx.chat_llm = FakeChat(final_resp("共 1 行"))
+    monkeypatch.setattr(server, "_sessions", SessionStore())
     return TestClient(server.app)
 
 
@@ -102,21 +123,24 @@ class TestSseChat:
         assert "共 1 行" in answer["text"]
         assert events[-1]["type"] == "done"
 
-    def test_tool_roundtrip_in_api(self, client, monkeypatch):
+    def test_tool_roundtrip_in_api(self, client, ctx):
         # 外层先调 query_sql 工具、拿到结果再给终答：
         # 节点事件应为 react_agent → tool_execute → react_agent 三轮
         chat = FakeChat(
             tool_resp("query_sql", '{"question": "多少种水果"}', "call_x"),
             final_resp("有 2 种水果"),
         )
-        monkeypatch.setattr(server, "chat_llm", chat)
+        ctx.chat_llm = chat
         with client.stream("POST", "/api/chat",
                            json={"session_id": "s1", "message": "多少种水果"}) as resp:
             events = parse_sse_lines(resp.iter_lines())
 
         node_events = [e for e in events if e["type"] == "node"]
+        # HITL（Sprint 1）：决策 → 生成计划 → 安全判定 → 执行 → 收尾。
+        # 多出来的两个节点正是"决定调用 query_sql"到"真正执行"之间
+        # 原本一片空白的部分，现在有真实进度可展示
         assert [e["node"] for e in node_events] == [
-            "react_agent", "tool_execute", "react_agent",
+            "react_agent", "plan_sql", "guard", "tool_execute", "react_agent",
         ]
         answer = [e for e in events if e["type"] == "answer"][0]
         assert answer["text"] == "有 2 种水果"
@@ -126,34 +150,33 @@ class TestSseChat:
         assert tool_msg["name"] == "query_sql"
         assert "共 1 行" in tool_msg["content"]
 
-    def test_no_tables_gives_error_answer(self, client, monkeypatch):
+    def test_no_tables_gives_error_answer(self, client, ctx):
         # 空库：外层会先调 list_tables 得知无表，再给出友好回答
         empty = DataService(AnalysisEngine(db_path=None))
         chat = FakeChat(
             tool_resp("list_tables"),
             final_resp("当前没有已加载的数据表，请先上传文件。"),
         )
-        monkeypatch.setattr(server, "service", empty)
-        monkeypatch.setattr(server, "chat_llm", chat)
+        ctx.service = empty
+        ctx.chat_llm = chat
         with client.stream("POST", "/api/chat",
                            json={"session_id": "s1", "message": "随便问"}) as resp:
             events = parse_sse_lines(resp.iter_lines())
         answer = [e for e in events if e["type"] == "answer"][0]
         assert "上传文件" in answer["text"]
 
-    def test_chart_event_streamed_once(self, client, monkeypatch):
-        # query_sql → plot_chart → 终答：SSE 应恰好一个 chart 事件
-        # （state.charts 在每个节点 update 里都带全量，差分后不重复）
+    def test_chart_event_streamed_once(self, client, ctx):
+        # query_sql → plot_chart → 终答：SSE 应恰好一个 chart 事件。
+        # Sprint 0 之后 charts 是 reducer 增量（每个节点只带自己新增的），
+        # 旧实现那套"已发送数量差分"会把第二轮之后的图表判成重复而丢掉，
+        # 这条和下面那条一起锁住"增量直发"的语义
         chat = FakeChat(
             tool_resp("query_sql", '{"question": "各水果总价"}', "c1"),
             tool_resp("plot_chart", '{"chart_type": "bar", "title": "总价对比"}', "c2"),
             final_resp("图表见上，banana 总价最高。"),
         )
-        monkeypatch.setattr(server, "chat_llm", chat)
-        monkeypatch.setattr(
-            server, "llm",
-            FakeLLM("SELECT name, sum(price) AS total FROM fruit GROUP BY name"),
-        )
+        ctx.chat_llm = chat
+        ctx.sql_llm = FakeLLM("SELECT name, sum(price) AS total FROM fruit GROUP BY name")
         with client.stream("POST", "/api/chat",
                            json={"session_id": "s1", "message": "统计总价并画图"}) as resp:
             events = parse_sse_lines(resp.iter_lines())
@@ -168,13 +191,36 @@ class TestSseChat:
         answer_idx = events.index([e for e in events if e["type"] == "answer"][0])
         assert chart_idx < answer_idx
 
-    def test_tool_call_event_carries_args_and_result(self, client, monkeypatch):
+    def test_two_charts_both_streamed(self, client, ctx):
+        # 回归：两轮"查询→画图"必须推送两张图。
+        # 用全量 state + 差分计数的旧写法时，第二张会被 sent 计数误判成
+        # 已发送而丢弃——这是 reducer 迁移时最容易静默回归的地方
+        chat = FakeChat(
+            tool_resp("query_sql", '{"question": "按名称统计"}', "c1"),
+            tool_resp("plot_chart", '{"chart_type": "bar"}', "c2"),
+            tool_resp("query_sql", '{"question": "按价格统计"}', "c3"),
+            tool_resp("plot_chart", '{"chart_type": "line"}', "c4"),
+            final_resp("两张图都给你了。"),
+        )
+        ctx.chat_llm = chat
+        # 两次 query_sql 各要一条 SQL（test_api 的 FakeLLM 用尽后回落 SELECT 1）
+        ctx.sql_llm = FakeLLM(
+            "SELECT name, sum(price) AS total FROM fruit GROUP BY name",
+            "SELECT name, sum(price) AS total FROM fruit GROUP BY name",
+        )
+        with client.stream("POST", "/api/chat",
+                           json={"session_id": "s1", "message": "画两张图"}) as resp:
+            events = parse_sse_lines(resp.iter_lines())
+
+        assert len([e for e in events if e["type"] == "chart"]) == 2
+
+    def test_tool_call_event_carries_args_and_result(self, client, ctx):
         # 工具调用应以 tool_call 事件推送：含工具名、原始参数、结果摘要
         chat = FakeChat(
             tool_resp("query_sql", '{"question": "多少种水果"}', "c1"),
             final_resp("有 2 种水果"),
         )
-        monkeypatch.setattr(server, "chat_llm", chat)
+        ctx.chat_llm = chat
         with client.stream("POST", "/api/chat",
                            json={"session_id": "s1", "message": "多少种水果"}) as resp:
             events = parse_sse_lines(resp.iter_lines())
@@ -187,7 +233,7 @@ class TestSseChat:
         assert ev["ok"] is True
         assert "共 1 行" in ev["result"]        # 工具结果摘要
 
-    def test_tool_events_not_lost_across_cycles(self, client, monkeypatch):
+    def test_tool_events_not_lost_across_cycles(self, client, ctx):
         # 跨轮回归护栏：两轮工具调用必须都送达。
         # state 是全量替换语义，react_agent 若不原样携带 tool_events，
         # 第一轮累积的事件会被整轮清空（与 steps 计数同一个坑）
@@ -196,7 +242,7 @@ class TestSseChat:
             tool_resp("query_sql", '{"question": "多少种水果"}', "c2"),
             final_resp("完成"),
         )
-        monkeypatch.setattr(server, "chat_llm", chat)
+        ctx.chat_llm = chat
         with client.stream("POST", "/api/chat",
                            json={"session_id": "s1", "message": "先看表再统计"}) as resp:
             events = parse_sse_lines(resp.iter_lines())
@@ -204,13 +250,13 @@ class TestSseChat:
         names = [e["name"] for e in events if e["type"] == "tool_call"]
         assert names == ["list_tables", "query_sql"]
 
-    def test_failed_tool_marked_not_ok(self, client, monkeypatch):
+    def test_failed_tool_marked_not_ok(self, client, ctx):
         # 工具失败（未知工具名）：ok=false，前端据此标红
         chat = FakeChat(
             tool_resp("drop_table", "{}", "c1"),
             final_resp("无法执行该操作"),
         )
-        monkeypatch.setattr(server, "chat_llm", chat)
+        ctx.chat_llm = chat
         with client.stream("POST", "/api/chat",
                            json={"session_id": "s1", "message": "删表"}) as resp:
             events = parse_sse_lines(resp.iter_lines())
@@ -219,14 +265,14 @@ class TestSseChat:
         assert ev["ok"] is False
         assert "未知工具" in ev["result"]
 
-    def test_node_message_carries_real_decision(self, client, monkeypatch):
+    def test_node_message_carries_real_decision(self, client, ctx):
         # 「思考」行的内容换成真实决策，不再是"正在分析决策…"占位文案。
         # tool_execute 步没有单独文案（空串），其真实内容由卡片承载
         chat = FakeChat(
             tool_resp("query_sql", '{"question": "多少种水果"}', "c1"),
             final_resp("有 2 种水果"),
         )
-        monkeypatch.setattr(server, "chat_llm", chat)
+        ctx.chat_llm = chat
         with client.stream("POST", "/api/chat",
                            json={"session_id": "s1", "message": "多少种水果"}) as resp:
             events = parse_sse_lines(resp.iter_lines())
@@ -234,19 +280,21 @@ class TestSseChat:
         msgs = [e["message"] for e in events if e["type"] == "node"]
         # 第一轮（react_agent，决定调工具）：真实决策
         assert msgs[0] == "决定调用 query_sql"
-        # 后续节点没有独立文案：tool_execute 由卡片承载，
-        # 收尾轮由答案气泡承载
-        assert all(m == "" for m in msgs[1:])
+        # HITL 之后中间两步也有真实文案：生成了什么计划、检查是否通过
+        assert msgs[1].startswith("已生成查询计划")
+        assert msgs[2] == "安全检查通过，开始执行"
+        # 执行步由 tool_call 卡片承载，收尾轮由答案气泡承载 → 空串
+        assert all(m == "" for m in msgs[3:])
         # 占位文案已彻底消失
         assert "正在分析决策…" not in msgs
         assert "正在查询数据…" not in msgs
 
 
 class TestSession:
-    def test_multi_turn_history_persists(self, client, monkeypatch):
+    def test_multi_turn_history_persists(self, client, ctx):
         # 同一 session_id 连问两轮：第二轮后端把第一轮历史喂给外层模型
         chat = FakeChat(final_resp("答一"), final_resp("答二"))
-        monkeypatch.setattr(server, "chat_llm", chat)
+        ctx.chat_llm = chat
 
         with client.stream("POST", "/api/chat",
                            json={"session_id": "sess", "message": "第一问"}) as resp:

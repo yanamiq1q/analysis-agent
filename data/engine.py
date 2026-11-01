@@ -8,10 +8,11 @@
 查询护栏（生产级）：
 - 行数上限：SQL 外包裹 LIMIT n+1，超限即报错——防止 LLM 生成的
   无筛选查询把整张表拉进内存
-- 执行超时：ThreadPoolExecutor + future.result(timeout)。DuckDB 本身
-  没有 statement_timeout（实测 1.5.6 不支持），只能线程池软超时：
-  超时后底层查询线程仍在跑（无法真正 kill），但新一轮查询会在
-  连接锁上排队，调用方不会无限等待
+- 执行超时：data.guards.run_with_timeout（daemon 线程 + conn.interrupt()）。
+  DuckDB 没有 statement_timeout（实测 1.5.6 不支持），但有一个
+  跨线程可用的 interrupt()：超时先真打断查询，再等它释放连接锁。
+  旧实现（ThreadPoolExecutor + result(timeout) + shutdown(wait=False)）
+  只是"调用方不等了"，工作线程仍持锁 → 后续查询全排队，已废弃。
 - 连接锁：DuckDB 单连接非线程安全，所有触达 _conn 的操作串行化
 """
 from __future__ import annotations
@@ -20,13 +21,13 @@ import re
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 from typing import Any
 
 import duckdb
 import pandas as pd
 
 import config
+from data.guards import SoftTimeout, run_with_timeout
 from data.validate import validate_sql
 from logging_setup import get_logger
 
@@ -42,7 +43,20 @@ class AnalysisEngine:
 
     def __init__(self, db_path: str | None = config.DUCKDB_PATH):
         # db_path=None 时是纯内存模式；否则持久化到文件
-        self._conn = duckdb.connect(db_path or ":memory:")
+        self._db_path = db_path
+        try:
+            self._conn = duckdb.connect(db_path or ":memory:")
+        except (duckdb.IOException, OSError) as exc:
+            # P0-1：DuckDB 是"单进程独占文件"的（不是单连接）。Web 与 MCP
+            # 两个进程同时指向同一文件时，第二个进程连只读都打不开。
+            # 原始报错是英文的 Cannot open file ...，这里翻译成能照做的提示。
+            raise QueryError(
+                f"无法打开数据仓库 {db_path or ':memory:'}："
+                "另一个进程正在使用它（DuckDB 同文件只允许一个读写进程）。"
+                "请只保留一个入口：要么用 web 服务内置的 /mcp 端点，"
+                "要么先停掉另一端的进程再启动本进程。"
+            ) from exc
+
         # ── 连接级封锁（第二道物理闸）────────────────────────────
         # 即使 AST 校验漏掉了某个未知函数/语法，DuckDB 本身也无法
         # 触碰文件系统 / 网络 / 外部库（统一抛 PermissionException）。
@@ -114,20 +128,18 @@ class AnalysisEngine:
 
         guarded_sql = self._with_row_guard(sql, limit)
         t0 = time.monotonic()
-        ex = ThreadPoolExecutor(max_workers=1)
         try:
-            future = ex.submit(self._execute_raw, guarded_sql)
-            try:
-                df = future.result(timeout=timeout)
-            except FutTimeout:
-                logger.warning("query timeout %.1fs sql=%.120s", timeout, sql)
-                # 注意：下层查询线程仍在跑（DuckDB 无法 kill），它继续
-                # 持有连接锁直到跑完；后续请求在锁上排队而非并发崩溃
-                raise QueryError(
-                    f"查询超过 {timeout:g} 秒未完成，请简化查询（加筛选/聚合条件）"
-                ) from None
-        finally:
-            ex.shutdown(wait=False)  # 不能 wait=True：那会让超时形同虚设
+            df = run_with_timeout(
+                lambda: self._execute_raw(guarded_sql),
+                timeout,
+                on_timeout=self._interrupt,
+                label="duckdb",
+            )
+        except SoftTimeout:
+            logger.warning("query timeout %.1fs sql=%.120s", timeout, sql)
+            raise QueryError(
+                f"查询超过 {timeout:g} 秒未完成，已中止；请简化查询（加筛选/聚合条件）"
+            ) from None
 
         if len(df) > limit:
             logger.warning("row guard triggered limit=%d rows=%d", limit, len(df))
@@ -136,6 +148,15 @@ class AnalysisEngine:
             )
         logger.info("query ok rows=%d ms=%.1f", len(df), (time.monotonic() - t0) * 1000)
         return df
+
+    def _interrupt(self) -> None:
+        """超时中断（P0-5）：DuckDB 支持跨线程打断正在执行的查询。
+
+        必须在查询线程之外调用（所以放在 on_timeout 回调里）。
+        中断后查询线程会以 InterruptException 退栈并释放连接锁——
+        这才是"超时"该有的效果，而不是让锁一直被占着。
+        """
+        self._conn.interrupt()
 
     def _execute_raw(self, sql: str) -> pd.DataFrame:
         """在 worker 线程内持锁执行（锁随查询走，见 __init__ 注释）。"""
@@ -173,6 +194,24 @@ class AnalysisEngine:
             "large_tables": sorted(self._large_tables),
             "total_tables": len(self.list_tables()),
         }
+
+    def estimated_rows(self, table_name: str) -> int | None:
+        """表的基数估算（HITL 风险判定用），不扫表。
+
+        DuckDB 在 `duckdb_tables()` 里维护 estimated_size（建表/写入时更新），
+        读它是 O(1) 的元数据查询；比 `SELECT count(*)` 便宜得多，也比解析
+        EXPLAIN 的字符画表格稳（试过，输出是带框线的本地化文本，不能依赖）。
+
+        视图/未知表返回 None——调用方按"基数未知"处理（宁可让用户确认）。
+        """
+        with self._conn_lock:
+            row = self._conn.execute(
+                "SELECT estimated_size FROM duckdb_tables() WHERE table_name = ?",
+                [table_name],
+            ).fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+        return None
 
     # ---------- 内部 ----------
 

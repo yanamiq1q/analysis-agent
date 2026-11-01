@@ -30,6 +30,17 @@
   button:disabled { opacity: .5; cursor: not-allowed; }
   #fileBtn { background: transparent; border: 1px solid var(--line); color: var(--muted); }
   input[type=file] { display: none; }
+  /* 审批卡片（HITL）：高危 SQL 执行前的人工确认 */
+  .approval { align-self: flex-start; max-width: 72%; background: #1d1a12; border: 1px solid #4a3a12; border-left: 3px solid #e0a52a; border-radius: 10px; padding: 12px 14px; font-size: 13px; }
+  .approval .a-title { color: #e0a52a; font-weight: 600; margin-bottom: 6px; }
+  .approval .a-hint { color: var(--muted); margin-bottom: 8px; }
+  .approval .a-sql { background: #0b0d11; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; color: #cfe3ff; font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; overflow-x: auto; }
+  .approval .a-reasons { margin: 8px 0 0 18px; color: #f0c674; }
+  .approval .a-reasons li { margin: 2px 0; }
+  .approval .a-note { width: 100%; margin-top: 10px; background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12px; }
+  .approval .a-btns { display: flex; gap: 8px; margin-top: 10px; }
+  .approval .a-btns button { padding: 4px 12px; font-size: 12px; }
+  .approval .a-btns .danger { background: transparent; border: 1px solid #6b3a34; color: #e8837a; }
 </style>
 </head>
 <body>
@@ -73,7 +84,6 @@ function addMessage(role, text) {
 
 // 打字机：把 text 逐字写入 el，像 AI 那样"流"出来而不是整段闪现。
 // 按时长打字而不是按固定帧数：短句约 0.5s、长文本最多 1.6s。
-// （最早按帧数写，短句 0.2s 就闪完了，肉眼几乎看不出流式效果）
 function typeInto(el, text, done) {
   el.textContent = '';
   if (!text) { if (done) done(); return; }
@@ -96,8 +106,6 @@ function addProgress(text) {
 }
 
 // Agent 步骤卡片：工具名 + 调用参数 + 结果摘要。
-// 这是 ReAct 的"思考过程"——deepseek-chat 决定调工具时不产出推理
-// 文本，模型的动作（查了哪张表、拿到什么）才是可展示的思考。
 function addToolCard(ev) {
   const div = document.createElement('div');
   div.className = 'tool' + (ev.ok ? '' : ' tool-err');
@@ -111,12 +119,135 @@ function addToolCard(ev) {
   div.appendChild(args);
   div.appendChild(res);
   chat.appendChild(div);
-  // 依次打字：工具名 → 参数 → 结果摘要，形成"一步步在做"的观感
   typeInto(name, ev.name, () => {
     typeInto(args, '参数: ' + (ev.arguments || '{}'), () => {
       typeInto(res, '→ ' + (ev.result || ''));
     });
   });
+}
+
+// 审批卡片（HITL）：高危 SQL 在执行前展示给用户。
+// 三件事必须说清楚：将执行什么 SQL、为什么拦、不确认会怎样。
+function addApprovalCard(evt) {
+  const wrap = document.createElement('div');
+  wrap.className = 'approval';
+
+  const title = document.createElement('div');
+  title.className = 'a-title';
+  title.textContent = '⚠ 执行前需要你确认';
+  wrap.appendChild(title);
+
+  if (evt.summary) {
+    const hint = document.createElement('div');
+    hint.className = 'a-hint';
+    hint.textContent = evt.summary;
+    wrap.appendChild(hint);
+  }
+
+  (evt.queries || []).forEach((q) => {
+    const sql = document.createElement('pre');
+    sql.className = 'a-sql';
+    sql.textContent = q.sql;           // textContent：SQL 里可能有 < > 等字符
+    wrap.appendChild(sql);
+    const ul = document.createElement('ul');
+    ul.className = 'a-reasons';
+    (q.reasons || []).forEach((r) => {
+      const li = document.createElement('li');
+      li.textContent = r;
+      ul.appendChild(li);
+    });
+    wrap.appendChild(ul);
+  });
+
+  const note = document.createElement('input');
+  note.className = 'a-note';
+  note.placeholder = '拒绝原因（可选，会告诉 Agent 怎么改）';
+  wrap.appendChild(note);
+
+  const row = document.createElement('div');
+  row.className = 'a-btns';
+  const ok = document.createElement('button');
+  ok.textContent = '批准执行';
+  const no = document.createElement('button');
+  no.textContent = '拒绝';
+  no.className = 'danger';
+  row.appendChild(ok);
+  row.appendChild(no);
+  wrap.appendChild(row);
+
+  chat.appendChild(wrap);
+  chat.scrollTop = chat.scrollHeight;
+
+  const disable = () => { ok.disabled = true; no.disabled = true; };
+  ok.onclick = () => { disable(); decide(evt.thread_id, 'approve', ''); };
+  no.onclick = () => { disable(); decide(evt.thread_id, 'reject', note.value.trim()); };
+}
+
+// 审批结果回到同一条 SSE 通道：确认只是让对话继续，不是另一个页面。
+async function decide(threadId, decision, note) {
+  statusEl.textContent = decision === 'approve' ? '执行中' : '处理中';
+  try {
+    const res = await fetch('/api/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thread_id: threadId, decision, note }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      addMessage('assistant', '确认失败: ' + (data.detail || res.status));
+      statusEl.textContent = '空闲';
+      return;
+    }
+    await consume(res);
+    statusEl.textContent = '空闲';
+  } catch (err) {
+    addMessage('assistant', '确认失败: ' + err.message);
+    statusEl.textContent = '空闲';
+  }
+}
+
+// 手写 SSE 解析：read() 返回的 chunk 可能把一行切成两半，
+// 必须用 stream:true 保留不完整字节 + 手动按 \n\n 切帧。
+// chat 与 approve 共用（两者的事件协议完全一致）。
+async function consume(res) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buf = '';
+  const seen = { answered: false, approval: false };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      if (!frame.startsWith('data: ')) continue;
+      const evt = JSON.parse(frame.slice(6));
+      if (evt.type === 'node') {
+        if (evt.message) addProgress(evt.message);
+      } else if (evt.type === 'tool_call') {
+        addToolCard(evt);
+      } else if (evt.type === 'chart') {
+        const div = document.createElement('div');
+        div.className = 'msg assistant';
+        const img = document.createElement('img');
+        img.src = evt.image;
+        img.className = 'chart-img';
+        div.appendChild(img);
+        chat.appendChild(div);
+        chat.scrollTop = chat.scrollHeight;
+      } else if (evt.type === 'approval_required') {
+        seen.approval = true;
+        addApprovalCard(evt);
+      } else if (evt.type === 'answer') {
+        seen.answered = true;
+        addMessage('assistant', evt.text);
+      }
+    }
+  }
+  if (!seen.answered && !seen.approval) addMessage('assistant', '（无回答）');
+  return seen;
 }
 
 // 断线重连：网络中断（fetch 失败/读流失败）自动重发同一请求，
@@ -140,10 +271,7 @@ async function send() {
 }
 
 async function sendOnce(message) {
-  // 本轮起点：重连前把中断留下的半截输出（进度行+答案气泡）回滚掉，
-  // 后端会从 start 帧开始重发完整事件流
   const baseCount = chat.children.length;
-  let answerBox = null;
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
@@ -151,52 +279,13 @@ async function sendOnce(message) {
       body: JSON.stringify({ session_id: sessionId, message, retry: retryCount > 0 }),
     });
     if (!res.ok) throw new ServerError('服务端错误 HTTP ' + res.status);
-    // 手写 SSE 解析：read() 返回的 chunk 可能把一行切成两半，
-    // 必须用 stream:true 保留不完整字节 + 手动按 \n\n 切帧
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder('utf-8');
-    let buf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf('\n\n')) >= 0) {
-        const frame = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        if (frame.startsWith('data: ')) {
-          const evt = JSON.parse(frame.slice(6));
-          if (evt.type === 'node') {
-            // 空 message = 该步没有单独可展示的真实内容
-            // （如 tool_execute，其真实内容由紧随的 tool_call 卡片承载）
-            if (evt.message) addProgress(evt.message);
-          } else if (evt.type === 'tool_call') {
-            addToolCard(evt);
-          } else if (evt.type === 'chart') {
-            // 图表事件：base64 data URI 直接渲染成图片（独立气泡，
-            // 与文字答案分开展示更清晰）
-            const div = document.createElement('div');
-            div.className = 'msg assistant';
-            const img = document.createElement('img');
-            img.src = evt.image;
-            img.className = 'chart-img';
-            div.appendChild(img);
-            chat.appendChild(div);
-            chat.scrollTop = chat.scrollHeight;
-          } else if (evt.type === 'answer') {
-            answerBox = addMessage('assistant', evt.text);
-          }
-        }
-      }
-    }
-    if (!answerBox) addMessage('assistant', '（无回答）');
+    await consume(res);
     statusEl.textContent = '空闲';
   } catch (err) {
     if (!(err instanceof ServerError) && retryCount < MAX_RETRY) {
       retryCount += 1;
       statusEl.textContent = `连接中断，正在重连（${retryCount}/${MAX_RETRY}）…`;
       await new Promise(r => setTimeout(r, retryCount * 1000));
-      // 回滚本轮半截输出后重试（后端按 retry 标记对历史做幂等去重）
       while (chat.children.length > baseCount) chat.removeChild(chat.lastChild);
       return sendOnce(message);
     }
@@ -231,7 +320,6 @@ fileInput.onchange = async () => {
 };
 
 // 连接远端 MySQL：连接串含密码，用 prompt 当场输入、不做任何存储。
-// 后端按冷热分层接入：小表搬进 DuckDB，大表留远端下推。
 document.getElementById('dbBtn').onclick = async () => {
   const url = prompt(
     'MySQL 连接串（请把 PASSWORD 替换成真实密码）:',

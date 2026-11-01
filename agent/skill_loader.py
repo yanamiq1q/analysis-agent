@@ -257,3 +257,45 @@ def build_metric_registry(skills: dict[str, Skill]) -> list[Metric]:
     for skill in skills.values():
         registry.extend(skill.metrics)
     return registry
+
+
+# ── 用户级指标持久化（M9：data/warehouse/user_metrics.md）──────────
+
+USER_METRICS_HEADER = "# 用户自定义指标口径（MCP save_metric_definition 写入，勿手改格式）\n"
+
+
+def load_user_metrics(path: Path) -> tuple[list[Metric], SkillDiagnostic | None]:
+    """读取用户级指标文件（与 references 同格式，复用同一解析器）。
+
+    文件不存在 = 没有用户指标，返回空列表（不是错误）。
+    文件存在但解析失败 → fail-closed：本次不上架任何用户指标，记 diagnostic，
+    绝不让半个口径溜进 registry。下次 save 会整体重写文件自愈。
+    """
+    if not path.is_file():
+        return [], None
+    try:
+        return parse_metric_references(path.read_text(encoding="utf-8")), None
+    except (SkillParseError, OSError) as exc:
+        return [], SkillDiagnostic(str(path), str(exc))
+
+
+def save_user_metric(path: Path, metric: Metric) -> None:
+    """把一条用户指标 upsert 进用户指标文件（同名覆盖，其余保留）。
+
+    文件是纯文本 markdown（与 references 完全同格式，可被
+    parse_metric_references 读回）。写盘失败抛异常，由调用方回喂用户。
+    """
+    existing, _ = load_user_metrics(path)
+    merged = [m for m in existing if m.name != metric.name] + [metric]
+    merged.sort(key=lambda m: m.name)
+    blocks: list[str] = []
+    for m in merged:
+        blocks.append(
+            f"## {m.name}\n"
+            f"- 别名: {' / '.join(m.aliases) or m.name}\n"
+            f"- 责任表: {'、'.join(m.tables)}\n"
+            f"- 口径SQL: {m.sql}\n"
+            f"- 说明: {m.description or f'用户自定义指标 {m.name}'}"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(USER_METRICS_HEADER + "\n" + "\n\n".join(blocks) + "\n", encoding="utf-8")

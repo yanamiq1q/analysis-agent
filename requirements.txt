@@ -1,8 +1,8 @@
-# data-agent dependencies (locked to major.minor)
+﻿# data-agent dependencies (locked to major.minor)
 fastapi>=0.115
 uvicorn
 python-multipart[standard]>=0.30
-langgraph>=0.2
+langgraph>=1,<2
 duckdb>=1.1
 sqlglot>=25
 sqlalchemy>=2.0
@@ -15,3 +15,4 @@ httpx>=0.27
 openai>=1.40
 matplotlib>=3.8
 mcp>=1.0,<2
+pyyaml>=6

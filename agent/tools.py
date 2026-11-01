@@ -20,30 +20,20 @@ M7 图表可视化：
 from __future__ import annotations
 
 import base64
-import io
 import json
 from typing import Callable
 
-import matplotlib
-
-matplotlib.use("Agg")  # 无界面后端：服务器环境出图，不弹窗口
-import matplotlib.pyplot as plt
-import pandas as pd
-
 import config
-from agent.graph import run_analysis
+from agent.graph import format_result_text, run_analysis
 from agent.llm import SqlGenerator
 from agent.skill_loader import Skill, list_skill_catalog
 from data.metrics import Metric
+from data.report.charts import KIND_LABELS, PLOT_KINDS, render_png
 from data.service import DataService
 
-# 中文字体（Windows 自带微软雅黑）：否则中文标题/标签渲染成方块
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
-plt.rcParams["axes.unicode_minus"] = False
-
-# 绘图元信息
-_PLOT_KINDS = {"bar", "line", "pie", "scatter"}  # 类型白名单
-_KIND_LABELS = {"bar": "柱状图", "line": "折线图", "pie": "饼图", "scatter": "散点图"}
+# 绘图元信息（白名单与中文名放在 data/report/charts.py，聊天和报告共用一份）
+_PLOT_KINDS = PLOT_KINDS
+_KIND_LABELS = KIND_LABELS
 
 # 工具 JSON schema（OpenAI function calling 格式）：
 # LLM 依赖这份描述决定"该调哪个工具、参数怎么填"
@@ -142,8 +132,23 @@ def build_tool_registry(
     """
     workspace: dict = {"df": None}  # 最近一次成功查询的结构化结果
 
-    def query_sql(question: str = "") -> str:
-        """自然语言子问题 → 走完整四节点安全链路 → 结果文本。"""
+    def query_sql(question: str = "", _plan: dict | None = None) -> str:
+        """自然语言子问题 → 走完整四节点安全链路 → 结果文本。
+
+        _plan（HITL）：上层图已经 dry-run 生成并通过校验的计划。有它就
+        直接执行计划里的 SQL——这保证"用户确认的那条 SQL"就是"真正执行的
+        那条 SQL"。否则同一条自然语言子问题让 LLM 再生成一次，可能得到
+        另一条等价但不同的 SQL（换了表 / 换了聚合），审批就白做了。
+        """
+        if _plan:
+            if _plan.get("error"):
+                return f"错误: {_plan['error']}"
+            sql = (_plan.get("sql") or "").strip()
+            if not sql:
+                return "错误: 未能生成可执行的 SQL"
+            df = service.query(sql)
+            workspace["df"] = df
+            return format_result_text(df)
         if not question.strip():
             return "错误: question 参数不能为空"
         result = run_analysis(
@@ -171,49 +176,13 @@ def build_tool_registry(
             )
 
         plot_df = df.head(config.MAX_PLOT_ROWS)
-        if len(plot_df.columns) < 2:
-            return (
-                "错误: 数据只有一列，无法绘图。请先 query_sql 查询含分组列"
-                "和数值列的结果（如 GROUP BY 分组统计）。",
-                None,
-            )
-        x_col = plot_df.columns[0]
-        if chart_type == "pie":
-            if not pd.api.types.is_numeric_dtype(plot_df[plot_df.columns[1]]):
-                return "错误: 饼图的数值列必须是数字类型。", None
-        else:
-            y_cols = [
-                c for c in plot_df.columns[1:]
-                if pd.api.types.is_numeric_dtype(plot_df[c])
-            ]
-            if not y_cols:
-                return "错误: 没有数字类型的数值列可用于绘图。", None
-
-        fig, ax = plt.subplots(figsize=(6, 4))
+        # 渲染与参数校验统一在 data/report/charts.py：聊天和报告必须画出
+        # 同一张图，不能两处各写一套（列判断/字体/饼图规则会慢慢分叉）
         try:
-            if chart_type == "pie":
-                plot_df.set_index(x_col)[plot_df.columns[1]].plot(
-                    kind="pie", ax=ax, autopct="%1.1f%%"
-                )
-                ax.set_ylabel("")
-            else:
-                y_cols = [
-                    c for c in plot_df.columns[1:]
-                    if pd.api.types.is_numeric_dtype(plot_df[c])
-                ]
-                plot_df.plot(
-                    kind=chart_type, x=x_col, y=y_cols or None,
-                    ax=ax, legend=bool(y_cols),
-                )
-                ax.set_xlabel(x_col)
-            if title:
-                ax.set_title(title)
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", bbox_inches="tight")
-            buf.seek(0)
-            uri = "data:image/png;base64," + base64.b64encode(buf.read()).decode("ascii")
-        finally:
-            plt.close(fig)  # Agg 后端也要显式关闭，防空跑内存泄漏
+            png = render_png(plot_df, chart_type, title)
+        except ValueError as exc:
+            return f"错误: {exc}", None
+        uri = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
 
         truncated = len(df) > config.MAX_PLOT_ROWS
         msg = (
@@ -249,6 +218,7 @@ def execute_tool_call(
     name: str,
     arguments_json: str,
     registry: dict[str, Callable],
+    plan: dict | None = None,
 ) -> dict:
     """按 openai tool_call 分发执行一招。
 
@@ -256,6 +226,11 @@ def execute_tool_call(
           "skill": M8 激活的技能名或 None}。
     skill 字段只有 load_skill 成功时非空，由外层 tool_execute 节点
     据此更新 state.active_skill 并注入技能全文。
+
+    plan（HITL）：query_sql 的已确认计划（{"sql", "error"}）。它不是
+    LLM 能传的参数——由 tool_execute 节点从 state 里取出来注入，
+    所以不会出现在工具 schema 里，也不会被模型伪造。
+
     防御点：
       - 未知工具：返回错误文本（LLM 幻觉出的工具名不崩循环）
       - 坏 JSON 参数：降级为空参数集
@@ -270,6 +245,8 @@ def execute_tool_call(
         args = {}
     if not isinstance(args, dict):
         args = {}
+    if plan is not None and name == "query_sql":
+        args = {**args, "_plan": plan}
     try:
         if name in ("plot_chart", "load_skill"):
             # 双返回值工具：(文本, 额外产物)——plot_chart=图URI，load_skill=技能名

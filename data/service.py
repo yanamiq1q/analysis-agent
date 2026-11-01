@@ -165,3 +165,16 @@ class DataService:
         if self._mysql and table_name in self._mysql.list_tables():
             return self._mysql.schema(table_name)
         raise QueryError(f"表不存在: {table_name}")
+
+    # ---------- 风险判定用的元信息（HITL / Sprint 1） ----------
+
+    def estimated_rows(self, table_name: str) -> int | None:
+        """本地表的基数估算；远端表/未知表返回 None（= 基数未知）。"""
+        if table_name in self.engine.list_tables():
+            return self.engine.estimated_rows(table_name)
+        return None
+
+    def is_remote(self, table_name: str) -> bool:
+        """该表是否留在远端（下推执行）：远端查询可能打生产库，风险更高。"""
+        folded = table_name.casefold()
+        return any(folded == t.casefold() for t in self._remote_tables)

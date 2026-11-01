@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 
 import pandas as pd
 import sqlglot
@@ -23,6 +22,7 @@ from sqlalchemy import Engine, create_engine, inspect, text
 
 import config
 from data.engine import AnalysisEngine, QueryError
+from data.guards import SoftTimeout, run_with_timeout
 from logging_setup import get_logger
 
 logger = get_logger("data.mysql")
@@ -136,25 +136,25 @@ class MySQLSource:
             减少对数仓源库的影响
           - 超时：MySQL 方言在 _execute_remote 里先 SET SESSION
             MAX_EXECUTION_TIME（8.0 服务端硬终止 SELECT）；其它方言
-            （SQLite 测试路径）退化为线程池软超时。shutdown(wait=False)
-            的原因与 engine 相同：wait=True 会让超时形同虚设。
+            （SQLite 测试路径）退化为 daemon 线程软超时。远端连接无法
+            像 DuckDB 那样 interrupt()，因此这里不传 on_timeout——
+            真正的止损靠服务端 MAX_EXECUTION_TIME。
         """
         limit = max_rows or config.MAX_QUERY_ROWS
         timeout = config.QUERY_TIMEOUT_SECONDS if timeout_s is None else timeout_s
         guarded = AnalysisEngine._with_row_guard(self._transpile(sql), limit)
         t0 = time.monotonic()
-        ex = ThreadPoolExecutor(max_workers=1)
         try:
-            future = ex.submit(self._execute_remote, guarded)
-            try:
-                df = future.result(timeout=timeout)
-            except FutTimeout:
-                logger.warning("mysql query timeout %.1fs sql=%.120s", timeout, sql)
-                raise QueryError(
-                    f"查询超过 {timeout:g} 秒未完成，请简化查询（加筛选/聚合条件）"
-                ) from None
-        finally:
-            ex.shutdown(wait=False)
+            df = run_with_timeout(
+                lambda: self._execute_remote(guarded),
+                timeout,
+                label="mysql",
+            )
+        except SoftTimeout:
+            logger.warning("mysql query timeout %.1fs sql=%.120s", timeout, sql)
+            raise QueryError(
+                f"查询超过 {timeout:g} 秒未完成，请简化查询（加筛选/聚合条件）"
+            ) from None
 
         if len(df) > limit:
             logger.warning("mysql row guard triggered limit=%d rows=%d", limit, len(df))
