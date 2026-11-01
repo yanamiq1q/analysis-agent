@@ -84,7 +84,7 @@ data-agent/
 ├── workbuddy-skill/  # WorkBuddy 技能（PR3）：report-producer，读报告包出 PPT/飞书文档
 ├── frontend/         # 原生 HTML 前端（fetch+getReader 手写 SSE 消费 + 打字机渲染）
 ├── scripts/          # stdw_init.sql：演示库 DDL（含 1200 行数据生成）
-├── tests/            # 326 个测试，全 fake 注入，无需真实 key/MySQL
+├── tests/            # 331 个测试，全 fake 注入，无需真实 key/MySQL
 └── config.py         # 单一配置源：全部阈值集中于此
 ```
 
@@ -286,12 +286,17 @@ python -m data.report.run --template monthly_ecom --period 2026-10
 3. 口径随包走（`definition` / `caveats` / `meta.queries`）；
 4. 失败是 `status=failed` + `error.code`，不是一段会被排进 PPT 的文字。
 
+口径可以完全不写 SQL：`monthly_ecom_locked` 模板里只写 `metric: gmv`，SQL 从
+`skills/metrics` 取，改口径只改 references——M4/M8 的口径治理终于接到了报告层。
+
+演示数据：`python scripts/seed_report_demo.py`（幂等补 2026-09 + 10 月后半月，`--clean` 回滚），
+补完就能看到真实环比。演示分镜见 [演示脚本-60秒.md](演示脚本-60秒.md)。
 设计文档：[WorkBuddy集成最终方案-2026-11-01.md](WorkBuddy集成最终方案-2026-11-01.md)。
 
 ## 测试
 
 ```powershell
-.venv\Scripts\python -m pytest -q     # 326 passed
+.venv\Scripts\python -m pytest -q     # 331 passed
 ```
 
 全部通过 fake LLM / SQLite 注入验证，**不需要 `DEEPSEEK_API_KEY`**：
