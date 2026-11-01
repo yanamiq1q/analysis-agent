@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "data-agent": {
+      "command": "C:\\Users\\k\\IdeaProjects\\data-agent\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "mcp_server"],
+      "env": {
+        "DEEPSEEK_API_KEY": "sk-xxx",
+        "DATA_AGENT_DB": "data/warehouse/analysis.duckdb"
+      }
+    }
+  }
+}
