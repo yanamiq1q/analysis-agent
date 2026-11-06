@@ -95,3 +95,8 @@ REPORT_JOBS_DIR = Path(
 )
 # 一份报告允许的最长耗时（秒）：防止某节 SQL 卡住整个 job
 REPORT_TIMEOUT_SECONDS = int(os.getenv("DATA_AGENT_REPORT_TIMEOUT", "600"))
+
+# ---- schema 采样（黄金集暴露的问题：模型会臆造枚举值）----
+# 只对行数不超过该值的表采样 VARCHAR 列的不同取值（如 status ∈ {paid, unpaid}），
+# 避免"库里存 paid、模型写成 支付"这种语法对、结果空、没人发现的错。
+SCHEMA_SAMPLE_MAX_ROWS = int(os.getenv("DATA_AGENT_SCHEMA_SAMPLE_MAX_ROWS", "100000"))

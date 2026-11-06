@@ -178,3 +178,10 @@ class DataService:
         """该表是否留在远端（下推执行）：远端查询可能打生产库，风险更高。"""
         folded = table_name.casefold()
         return any(folded == t.casefold() for t in self._remote_tables)
+
+    def distinct_values(self, table_name: str, column_name: str,
+                        limit: int = 8) -> list[str]:
+        """本地表的低基数列取值；远端表不做（避免打源库）。"""
+        if table_name in self.engine.list_tables():
+            return self.engine.distinct_values(table_name, column_name, limit)
+        return []

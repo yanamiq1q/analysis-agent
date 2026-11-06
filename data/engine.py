@@ -195,6 +195,25 @@ class AnalysisEngine:
             "total_tables": len(self.list_tables()),
         }
 
+    def distinct_values(self, table_name: str, column_name: str,
+                        limit: int = 8) -> list[str]:
+        """取一列的前若干个不同值（给 schema 当"枚举"提示）。
+
+        为什么需要它：模型会把库里的 ``paid`` 改写成中文"支付"——它不知道
+        真实取值，就按字面意思翻译，查询返回 0 行却不报错。这是最像"幻觉"
+        的一种错：语法全对、结果为空、没人发现。
+
+        只对低基数列调用（调用方按 VARCHAR + 行数上限过滤），代价可控。
+        """
+        safe_table = table_name.replace('"', '""')
+        safe_col = column_name.replace('"', '""')
+        with self._conn_lock:
+            rows = self._conn.execute(
+                f'SELECT DISTINCT "{safe_col}" FROM "{safe_table}" '
+                f'WHERE "{safe_col}" IS NOT NULL LIMIT {int(limit) + 1}'
+            ).fetchall()
+        return [str(r[0]) for r in rows]
+
     def estimated_rows(self, table_name: str) -> int | None:
         """表的基数估算（HITL 风险判定用），不扫表。
 

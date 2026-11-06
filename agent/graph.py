@@ -97,7 +97,34 @@ def build_graph(
         for t in tables:
             cols = service.table_schema(t)
             col_desc = ", ".join(f"{c['name']}({c['type']})" for c in cols)
-            parts.append(f"表 {t}: {col_desc}")
+            # 行数是选表的关键信号：仓库里有 20 张表、一半是空表，
+            # 不告诉模型"这张表有没有数据"，它会挑一个名字更顺眼但空着的表
+            # （黄金集第一版就是这么错的：GMV 去查了日汇总表）
+            try:
+                rows = service.estimated_rows(t)
+            except Exception:
+                rows = None
+            suffix = "（暂无数据）" if rows == 0 else (f"（约 {rows:,} 行）" if rows else "")
+            line = f"表 {t}{suffix}: {col_desc}"
+
+            # 低基数列采样真实取值：模型不知道库里存的是 paid，就会按字面
+            # 翻译成"支付"，查询返回 0 行却不报错——语法全对、结果全错。
+            if rows and rows <= config.SCHEMA_SAMPLE_MAX_ROWS:
+                hints: list[str] = []
+                for col in cols:
+                    if len(hints) >= 4:
+                        break
+                    if not str(col["type"]).upper().startswith("VARCHAR"):
+                        continue
+                    try:
+                        values = service.distinct_values(t, col["name"], limit=8)
+                    except Exception:
+                        values = []
+                    if 0 < len(values) <= 8:
+                        hints.append(f"{col['name']}∈{{{', '.join(values)}}}")
+                if hints:
+                    line += "  枚举: " + "; ".join(hints)
+            parts.append(line)
         schema_text = "\n".join(parts)
 
         # 指标口径注入：M4
@@ -271,7 +298,13 @@ def run_analysis(
         {"role": "assistant", "content": text},
     ]
     # df 供上层（plot_chart 工具）直接取结构化结果，M7 图表用
-    return {"result_text": text, "history": new_history, "df": result.get("df")}
+    # sql 一并返回：评测/排障时要知道"模型到底写了什么"，只看结果无法归因
+    return {
+        "result_text": text,
+        "history": new_history,
+        "df": result.get("df"),
+        "sql": result.get("sql") or "",
+    }
 
 
 def run_plan(
