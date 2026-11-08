@@ -57,6 +57,8 @@ class JobManager:
     def __init__(self, max_workers: int = 2, root: Path | str | None = None) -> None:
         self._root = Path(root) if root else None
         self._jobs: dict[str, JobHandle] = {}
+        # 正在跑的任务：同一 job 不允许两个线程同时写一个目录
+        self._active: set[str] = set()
         self._lock = threading.Lock()
         self._pool = _Pool(max_workers)
 
@@ -79,9 +81,15 @@ class JobManager:
         """
         job_id = make_job_id(request, request.period_start, request.period_end)
         with self._lock:
-            if job_id in self._jobs:
+            if job_id in self._active:
+                logger.info('report job already running id=%s', job_id)
                 return job_id
             self._jobs[job_id] = JobHandle(job_id, time.time())
+            self._active.add(job_id)
+            watchdog = threading.Timer(config.REPORT_TIMEOUT_SECONDS,
+                                      self._on_timeout, args=(job_id,))
+            watchdog.daemon = True
+            watchdog.start()
 
             job_dir = self.job_dir(job_id)
             job_dir.mkdir(parents=True, exist_ok=True)
@@ -102,6 +110,10 @@ class JobManager:
 
     def _run(self, service, request: ReportRequest, job_id: str,
              metric_registry=None) -> None:
+        watchdog = threading.Timer(config.REPORT_TIMEOUT_SECONDS,
+                                   self._on_timeout, args=(job_id,))
+        watchdog.daemon = True
+        watchdog.start()
         try:
             run_report(
                 service,
@@ -123,7 +135,32 @@ class JobManager:
                     error={"code": type(exc).__name__, "message": str(exc)},
                 )
 
-    # ── 查询 ────────────────────────────────────────────────────
+        finally:
+            watchdog.cancel()
+            with self._lock:
+                self._active.discard(job_id)
+
+    def _on_timeout(self, job_id: str) -> None:
+        """墙钟超时：把状态写成 failed(timeout)。
+
+        注意：Python 线程杀不掉，工作线程可能还在跑并稍后写 succeeded。
+        所以这里只负责"让宿主看到一个明确的终态"，真正的单跑由 _active 保证。
+        """
+        with self._lock:
+            if job_id not in self._active:
+                return
+        logger.warning("report job timeout id=%s", job_id)
+        try:
+            write_status(
+                self.job_dir(job_id),
+                job_id=job_id,
+                status="failed",
+                stage="timeout",
+                error={"code": "timeout",
+                       "message": f"报告超过 {config.REPORT_TIMEOUT_SECONDS} 秒未完成"},
+            )
+        except Exception as exc:  # noqa: BLE001 - 看门狗不能自己炸
+            logger.warning("write timeout status failed id=%s error=%s", job_id, exc)
 
     def wait(self, job_id: str, timeout_seconds: float) -> dict:
         """等到终态或超时（返回最后一次状态，不抛异常）。"""
