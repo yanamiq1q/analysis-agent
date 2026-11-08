@@ -1,4 +1,4 @@
-"""M5c/M6 测试：FastAPI + SSE 流式端点（M6 起走 ReAct 外层图）。
+﻿"""M5c/M6 测试：FastAPI + SSE 流式端点（M6 起走 ReAct 外层图）。
 
 用 FastAPI 自带 TestClient 验证 SSE 帧格式、事件序列、会话多轮、
 上传注册。内层 SQL LLM 注入 FakeLLM、外层调度 LLM 注入 FakeChat
@@ -446,3 +446,41 @@ class TestConnectMysql:
         masked = server._mask_url("mysql+pymysql://root:secret@127.0.0.1:3306/stdw")
         assert "secret" not in masked
         assert "root" in masked and "127.0.0.1" in masked
+
+class TestFastAPIHardening:
+    """真实部署会踩的 FastAPI 细节：参数约束、错误形态、request_id、探针。"""
+
+    def test_healthz(self, client):
+        r = client.get("/healthz")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+
+    def test_request_id_header(self, client):
+        r = client.get("/api/tables")
+        assert r.status_code == 200
+        assert r.headers["X-Request-Id"]
+
+    def test_chat_rejects_empty_message(self, client):
+        r = client.post("/api/chat", json={"session_id": "s1", "message": ""})
+        assert r.status_code == 422
+        body = r.json()
+        assert body["error"]["code"] == "invalid_request"
+        assert body["error"]["request_id"] == r.headers["X-Request-Id"]
+
+    def test_chat_rejects_bad_session_id(self, client):
+        r = client.post("/api/chat",
+                        json={"session_id": "bad id/../", "message": "hi"})
+        assert r.status_code == 422
+        assert "session_id" in r.json()["error"]["message"]
+
+    def test_mysql_rejects_non_mysql_url(self, client):
+        r = client.post("/api/connect_mysql", json={"url": "postgres://x/y"})
+        assert r.status_code == 422
+        assert "mysql" in r.json()["error"]["message"]
+
+    def test_http_error_keeps_detail_for_old_clients(self, client):
+        r = client.post("/api/chat", json={"session_id": "s2", "message": "hi"})
+        assert r.status_code == 200   # fake 模型能答
+        r = client.post("/api/approve", json={"thread_id": "nope"})
+        assert r.status_code in (400, 404, 409)
+        assert r.json()["detail"] == r.json()["error"]["message"]

@@ -37,12 +37,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Iterator
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 import config
 from agent.react import build_react_graph, initial_messages
@@ -98,6 +99,77 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="data-agent", lifespan=lifespan)
 app.add_middleware(_McpPathAlias)
+
+
+class _RequestId:
+    """给每个请求分配 request_id，并回写响应头。
+
+    用纯 ASGI 而不是 ``@app.middleware("http")``：BaseHTTPMiddleware 会把
+    流式响应再包一层，SSE 的"边算边发"容易被它打乱，断线时还会抛
+    "No response returned"。这里只在响应头里加一个字段，不碰 body。
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+
+        rid = ""
+        for name, value in scope.get("headers") or []:
+            if name == b"x-request-id":
+                rid = value.decode("latin-1")[:64]
+                break
+        rid = rid or uuid.uuid4().hex[:12]
+        scope.setdefault("state", {})["request_id"] = rid
+
+        async def send_with_id(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or [])
+                headers.append((b"x-request-id", rid.encode()))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_id)
+
+
+app.add_middleware(_RequestId)
+
+
+def _error_body(code: str, message: str, request: Request | None = None) -> dict:
+    rid = getattr(getattr(request, "state", None), "request_id", "") if request else ""
+    # detail 保留：旧前端和既有测试按 detail 读；error 是给新调用方的结构化形态
+    return {
+        "error": {"code": code, "message": message, "request_id": rid},
+        "detail": message,
+    }
+
+
+@app.exception_handler(RequestValidationError)
+async def _on_validation_error(request: Request, exc: RequestValidationError):
+    first = (exc.errors() or [{}])[0]
+    loc = ".".join(str(p) for p in first.get("loc", []) if p != "body")
+    message = (f"{loc}: {first.get('msg', '参数不合法')}" if loc
+               else str(first.get("msg", "参数不合法")))
+    return JSONResponse(status_code=422,
+                        content=_error_body("invalid_request", message, request))
+
+
+@app.exception_handler(HTTPException)
+async def _on_http_error(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_body(f"http_{exc.status_code}", str(exc.detail), request),
+    )
+
+
+@app.get("/healthz")
+def healthz():
+    """存活探针：不碰 DuckDB、不碰 LLM，纯内存返回。"""
+    return {"status": "ok", "service": "data-agent", "time": time.time()}
+
+
 app.mount("/mcp", _mcp.streamable_http_app())
 
 # 会话历史（有状态后端）：session_id -> [{role, content}, ...]
@@ -117,23 +189,35 @@ _UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class ChatRequest(BaseModel):
-    session_id: str = "default"
-    message: str
+    # 约束这些字段不是为了"好看"：session_id 是内存字典的键，不限制长度和字符，
+    # 一个客户端就能把内存撑大；message 无上限则会直接进 prompt（成本失控）。
+    session_id: str = Field(default="default", min_length=1, max_length=64,
+                            pattern=r"^[A-Za-z0-9_.-]+$")
+    message: str = Field(min_length=1, max_length=4000)
     retry: bool = False  # 断线重连重发标记：后端据此对历史做幂等去重
 
 
 class MySQLConnectRequest(BaseModel):
     """MySQL 连接请求：url 是完整连接串（含账号密码）。"""
-    url: str
+    url: str = Field(min_length=10, max_length=500)
     # 冷热分流行数阈值；None 时用 config.LAZY_LOAD_ROW_LIMIT
     lazy_limit: int | None = None
+
+    @field_validator("url")
+    @classmethod
+    def _check_scheme(cls, value: str) -> str:
+        # 只接受 MySQL 连接串：这个端点会让服务去连外部数据库，
+        # 不做前缀校验等于把"连哪都行"开放给任何调用方。
+        if not value.startswith(("mysql://", "mysql+pymysql://", "mariadb://")):
+            raise ValueError("仅支持 mysql:// 或 mysql+pymysql:// 连接串")
+        return value
 
 
 class ApproveRequest(BaseModel):
     """HITL 审批：恢复被 interrupt 挂起的那一轮。"""
-    thread_id: str
-    decision: str = "approve"   # approve / reject
-    note: str = ""              # 拒绝原因：会作为工具结果回喂给 LLM
+    thread_id: str = Field(min_length=1, max_length=64)
+    decision: str = Field(default="approve", pattern=r"^(approve|reject)$")
+    note: str = Field(default="", max_length=500)
 
 
 def _mask_url(url: str) -> str:
@@ -153,8 +237,12 @@ def _error_stream(message: str) -> Iterator[str]:
 
 
 @app.post("/api/connect_mysql")
-async def connect_mysql(req: MySQLConnectRequest):
+def connect_mysql(req: MySQLConnectRequest):
     """接入远端 MySQL（M5a）：小表搬进 DuckDB、大表留远端下推。
+
+    注意这里是 ``def`` 而不是 ``async def``：连接远端库可能要几秒到几十秒，
+    在 ``async def`` 里同步调用会把事件循环卡住——期间所有请求（包括
+    别人的聊天流）都停住。同步端点由 Starlette 丢进线程池，不挡事件循环。
 
     连接是"按需手动"而非服务启动时自动——连接串含账号密码，
     属于用户输入而非固定配置，不该硬编码在启动参数里。
@@ -477,12 +565,15 @@ def approve(req: ApproveRequest):
 
 
 @app.post("/api/upload")
-async def upload(file: UploadFile = File(...)):
+def upload(file: UploadFile = File(...)):
     """上传数据文件（CSV/Excel/JSON/Parquet）注册进引擎。
 
     P0-4：按块读取 + 边读边计数，超过 config.MAX_UPLOAD_BYTES 立刻
     413 中止。旧实现是 ``await file.read()`` 一次读进内存，50MB 的
     限制在 loaders 里才检查——文件早就进内存了，等于没有限制。
+
+    这里是 ``def``：解析 Excel/Parquet 是同步 CPU/IO 操作，放 ``async def``
+    里会把事件循环卡住（50MB 文件解析几秒，全站跟着卡几秒）。
     """
     t0 = time.monotonic()
     filename = file.filename or ""
@@ -509,7 +600,7 @@ async def upload(file: UploadFile = File(...)):
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = Path(tmp.name)
             while True:
-                chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+                chunk = file.file.read(_UPLOAD_CHUNK_BYTES)
                 if not chunk:
                     break
                 total += len(chunk)
