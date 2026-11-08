@@ -1,4 +1,4 @@
-"""M2 测试：sqlglot AST 安全校验。"""
+﻿"""M2 测试：sqlglot AST 安全校验。"""
 import pytest
 
 import config
@@ -174,3 +174,15 @@ class TestTableWhitelist:
     def test_case_insensitive(self):
         # DuckDB 表名大小写不敏感，白名单比较也要一致
         assert validate_sql("SELECT * FROM ORDERS", allowed_tables=["orders"]) is None
+
+def test_windows_absolute_path_rejected_on_posix(monkeypatch):
+    """Linux 上 Path('C:/...') 是相对路径，会被拼进白名单根 → fail-open。
+
+    强制 os.name=posix 模拟 CI 环境，断言直接拒绝。
+    """
+    from data import validate
+    from config import DATA_DIR
+
+    monkeypatch.setattr(validate.os, "name", "posix")
+    err = validate._check_single_path("C:/windows/system.ini", [DATA_DIR])
+    assert err and "目录" in err

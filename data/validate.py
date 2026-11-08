@@ -21,6 +21,7 @@ AST 校验 = 把 SQL 解析成语法树，按"结构"判断，而不是按"字�
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -318,6 +319,16 @@ def _check_single_path(path_str: str, norm_roots: list[Path]) -> Optional[str]:
     for scheme in _BLOCKED_URL_SCHEMES:
         if lowered.startswith(scheme):
             return f"禁止网络路径：{path_str}（只允许本地目录内文件）。"
+
+    # ── Windows 绝对路径：在 Linux 上必须直接拒绝 ─────────────────
+    # Path('C:/windows/x.ini') 在 Linux 上是相对路径，会被拼到白名单根
+    # 下面，relative_to() 于是通过——安全校验 fail-open（CI 在 Linux 上
+    # 就是这样漏掉的）。
+    if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\])", path_str) and os.name != "nt":
+        return (
+            f"路径不在允许的目录内：{path_str}（允许的根目录: "
+            + ", ".join(str(r) for r in norm_roots) + "）。"
+        )
 
     # ── 解析成绝对路径 ──────────────────────────────────────────────
     try:
