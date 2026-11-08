@@ -1,4 +1,4 @@
-"""LangGraph 主链路（M3）：用户问题 → 分析结果。
+﻿"""LangGraph 主链路（M3）：用户问题 → 分析结果。
 
 四节点 + 两条失败重试边：
 
@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import re
 import time
 
 from langgraph.graph import END, START, StateGraph
@@ -61,6 +62,32 @@ def format_result_text(df, max_rows: int = config.MAX_RESULT_ROWS) -> str:
     """
     head = df.head(max_rows)
     return f"共 {len(df)} 行，展示前 {len(head)} 行：\n" + head.to_string(index=False)
+
+
+_TIME_HINTS = ("年", "月", "日", "季度", "周", "最近", "本月", "上月", "今年", "去年")
+_DATE_COLUMNS = {"dt", "date", "day", "month", "ds", "stat_date"}
+
+
+def _has_time_hint(question: str) -> bool:
+    if any(hint in question for hint in _TIME_HINTS):
+        return True
+    return bool(re.search(r"\d{4}\s*[-/年]\s*\d{1,2}", question))
+
+
+def _metric_has_time_column(metric, service) -> bool:
+    """口径本身带日期过滤，或责任表有日期列 → 才能按时间过滤。"""
+    if re.search(r"\b(dt|date|day|month|ds)\b", metric.sql or "", re.IGNORECASE):
+        return True
+    for table in metric.tables:
+        try:
+            columns = service.table_schema(table)
+        except Exception:
+            continue
+        for column in columns:
+            name = str(column["name"]).lower()
+            if name in _DATE_COLUMNS or name.endswith(("_date", "_dt", "_at", "_time")):
+                return True
+    return False
 
 
 def build_graph(
@@ -130,12 +157,29 @@ def build_graph(
         # 指标口径注入：M4
         question = state.get("question", "")
         matched = match_metrics(question, set(tables), metric_registry)
+        blocked: list[Metric] = []
+        if matched and _has_time_hint(question):
+            # 口径锁表 vs 时间过滤的冲突：问"10 月 GMV"，而 GMV 的责任表
+            # 没有日期列时，套用口径只会得到全量数字、冒充区间结果。
+            # 这种情况不注入口径，改为明确告诉模型"这个口径没有时间维度"。
+            usable = []
+            for metric in matched:
+                (usable if _metric_has_time_column(metric, service) else blocked).append(metric)
+            matched = usable
         if matched:
             logger.info("collect_schema matched_metrics=%s",
                         [m.name for m in matched])
         metrics_prompt = format_metrics_prompt(matched)
         if metrics_prompt:
             schema_text = schema_text + "\n\n" + metrics_prompt
+        if blocked:
+            names = "、".join(f"{m.name}（{','.join(m.tables)} 无日期列）" for m in blocked)
+            logger.info("collect_schema metric_time_conflict=%s", names)
+            schema_text += (
+                f"\n\n【口径提示】{names} 只有全量口径，无法按时间过滤。"
+                "如果用户要时间范围，请改用带日期列的明细/汇总表，"
+                "并在结论里说明口径差异；不要拿全量数字冒充区间结果。"
+            )
         logger.info("collect_schema done ms=%.1f", (time.monotonic() - t0) * 1000)
         return {"schema_text": schema_text}
 
