@@ -137,6 +137,50 @@ class _RequestId:
 app.add_middleware(_RequestId)
 
 
+class _MaxBodySize:
+    """在 Starlette 解析 multipart **之前**拒绝超大请求。
+
+    端点里的分块计数只能防"进了端点之后"——而 multipart 在进端点之前
+    就已经被 Starlette 收完并 spool 到磁盘了。所以 10GB 的上传会先把
+    磁盘写满，才轮到我们回 413。
+
+    Content-Length 能提前拒绝就提前拒绝；没有这个头（chunked）时只能
+    靠端点里的计数兜底。
+    """
+
+    def __init__(self, app, limit: int) -> None:
+        self.app = app
+        self.limit = limit
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            length = 0
+            for name, value in scope.get("headers") or []:
+                if name == b"content-length":
+                    try:
+                        length = int(value)
+                    except ValueError:
+                        length = 0
+                    break
+            if length > self.limit:
+                body = json.dumps(_error_body(
+                    "payload_too_large",
+                    f"请求体超过上限 {self.limit // (1024 * 1024)}MB",
+                ), ensure_ascii=False).encode("utf-8")
+                await send({
+                    "type": "http.response.start",
+                    "status": 413,
+                    "headers": [(b"content-type", b"application/json; charset=utf-8"),
+                                (b"content-length", str(len(body)).encode())],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_MaxBodySize, limit=config.MAX_UPLOAD_BYTES)
+
+
 def _error_body(code: str, message: str, request: Request | None = None) -> dict:
     rid = getattr(getattr(request, "state", None), "request_id", "") if request else ""
     # detail 保留：旧前端和既有测试按 detail 读；error 是给新调用方的结构化形态
@@ -168,6 +212,29 @@ async def _on_http_error(request: Request, exc: HTTPException):
 def healthz():
     """存活探针：不碰 DuckDB、不碰 LLM，纯内存返回。"""
     return {"status": "ok", "service": "data-agent", "time": time.time()}
+
+
+@app.get("/readyz")
+def readyz():
+    """就绪探针：真的碰一下 DuckDB（SELECT 1）。
+
+    和 /healthz 的区别：healthz 只代表"进程活着"；readyz 代表"现在能查数"。
+    库被另一个进程占住、文件损坏时，healthz 仍是 200，readyz 应该是 503。
+
+    不检查 LLM key：没 key 时"查数/出报告"仍然可用，只是问答不可用——
+    这是降级，不是未就绪。
+    """
+    try:
+        service = get_context().ensure_service()
+        service.engine.execute_query("SELECT 1")
+        tables = service.list_tables()
+    except Exception as exc:  # noqa: BLE001 - 探针要把任何失败都变成 503
+        logger.warning("readyz failed error=%s", exc)
+        return JSONResponse(status_code=503, content={
+            "status": "not_ready",
+            "checks": {"duckdb": f"error: {exc}"},
+        })
+    return {"status": "ready", "checks": {"duckdb": "ok"}, "tables": len(tables)}
 
 
 app.mount("/mcp", _mcp.streamable_http_app())

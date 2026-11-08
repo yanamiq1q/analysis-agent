@@ -484,3 +484,42 @@ class TestFastAPIHardening:
         r = client.post("/api/approve", json={"thread_id": "nope"})
         assert r.status_code in (400, 404, 409)
         assert r.json()["detail"] == r.json()["error"]["message"]
+    def test_readyz_reports_database(self, client):
+        r = client.get("/readyz")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ready"
+        assert r.json()["checks"]["duckdb"] == "ok"
+
+    def test_readyz_503_when_database_unavailable(self, client, monkeypatch):
+        class Boom:
+            def ensure_service(self):
+                raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(server, "get_context", lambda: Boom())
+        r = client.get("/readyz")
+        assert r.status_code == 503
+        assert r.json()["status"] == "not_ready"
+
+    def test_body_limit_rejects_before_parsing(self):
+        import asyncio
+
+        called = {"app": False}
+
+        async def inner_app(scope, receive, send):
+            called["app"] = True
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        async def receive():
+            return {"type": "http.request", "body": b""}
+
+        middleware = server._MaxBodySize(inner_app, limit=10)
+        scope = {"type": "http", "method": "POST", "path": "/api/upload",
+                 "headers": [(b"content-length", b"1000")]}
+        asyncio.run(middleware(scope, receive, send))
+        # 关键断言：请求体没进到端点（Starlette 根本没机会 spool 到磁盘）
+        assert called["app"] is False
+        assert sent[0]["status"] == 413
