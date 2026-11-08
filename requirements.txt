@@ -1,7 +1,9 @@
-﻿# data-agent dependencies (locked to major.minor)
+# data-agent dependencies (locked to major.minor)
 fastapi>=0.115
 uvicorn
-python-multipart[standard]>=0.30
+# python-multipart 的版本号是 0.0.x（最新 0.0.33）；
+# 之前写 >=0.30 根本不存在这个版本，CI 的 pip install 直接失败。
+python-multipart[standard]>=0.0.9,<1
 langgraph>=1,<2
 duckdb>=1.1
 sqlglot>=25

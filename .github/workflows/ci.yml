@@ -18,7 +18,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
       - name: Run tests
         # 全量单测：不依赖真实 LLM key 与 MySQL（测试内均用 fake/SQLite 注入路径）
+        # DATA_AGENT_DB=:memory: 与本地口径一致，避免 CI 去碰不存在的仓库文件
+        env:
+          DATA_AGENT_DB: ":memory:"
         run: python -m pytest -q
